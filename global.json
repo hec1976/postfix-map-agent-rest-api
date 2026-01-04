@@ -1,0 +1,24 @@
+ {
+  "listen": "0.0.0.0:3000",
+  "allowed_ips": ["127.0.0.1/32", "192.168.20.0/24", "10.0.0.0/8"],
+  
+  "ssl_enable": 0,
+  "ssl_cert_file": "",
+  "ssl_key_file": "",
+ 
+  "serviceUser": "root",
+  "serviceGroup": "root",
+ 
+  "fileMode_service": "0644",
+  "fileMode_backup":  "0660",
+
+ 
+  "dirs": {
+    "service_folder": ["tmpDir", "backupDir"],
+    "service_mode": "0770"
+  },
+  
+  "logfile": "/var/log/postfix-agent.log",
+  "tmpDir": "/opt/postfix-agent/tmp",
+  "backupDir": "/opt/postfix-agent/backup"
+}
