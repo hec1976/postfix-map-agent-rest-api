@@ -6,8 +6,6 @@
 
 Ein kleiner REST Dienst (Mojolicious Lite), der Postfix Map Dateien pro Instanz verwaltet. Fokus ist Betriebssicherheit: atomare Writes, Backups mit Rotation, per Map Locking und optionaler Reload Status via systemd oder postmulti. Die API loescht **keine** Dateien auf dem Postfix Dateisystem. `delmap` entfernt nur Registrierungen in `configs.json` und liefert Hinweise zur manuellen Bereinigung.
 
-Quelle: Script Stand in fileciteturn0file0
-
 ## Features
 
 - REST API fuer Map Dateien pro Instanz (lesen, schreiben, Restore aus Backup)
