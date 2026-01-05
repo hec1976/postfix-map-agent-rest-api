@@ -1,5 +1,17 @@
-#!/usr/bin/env perl
 # Postfix Map Agent - REST
+# Version: 1.5.2 (2026-01-05, Mojo-only, async subprocess)
+#
+# Fixes ggü. 1.5.1:
+# - Single-Instanz wieder kompatibel: configs.json im alten Flat-Format wird intern automatisch zu instances.default gewrappt
+# - reload_config macht das gleiche Wrapping wie beim Start, damit Single nach einem Reload nicht wieder kaputt geht
+# - _rebuild_cfgmap_from nutzt ebenfalls das Wrapping, damit delmap und Config-Updates bei Single stabil bleiben
+# - Instanzname wird konsistent normalisiert (leer oder undef wird zu default), damit Lockdir und Instanzzugriff nie auf "" laufen
+# - delmap normalisiert inst ebenfalls, damit deregistrieren bei Single und Multi gleich funktioniert
+# - Lesefehler-Ausgaben robuster: read_raw/read_text melden jetzt $@ oder $! (Mojo File Fehler landen oft in $@)
+#
+# Verhalten:
+# - Logik bleibt analog zu 1.3.3: gleiche API Semantik, gleiche Map/Backup/Reload Ablaufe
+# - Multi-Instanz Verhalten bleibt unveraendert, Single ist nur Rueckwaerts-Kompatibilitaet
 # Version: 1.5.1 (2026-01-04, Mojo-only, async subprocess)
 #
 # Änderungen ggü. 1.3.3:
