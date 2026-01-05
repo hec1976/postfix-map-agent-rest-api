@@ -1,71 +1,111 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
+
 use Mojolicious::Lite;
 use Mojo::Log;
 use Mojo::File qw(path);
-use Mojo::JSON qw(decode_json encode_json true false);
-use Mojo::Util qw(url_escape secure_compare steady_time decode);
+use Mojo::JSON qw(decode_json to_json true false);
+use Mojo::Util qw(url_escape secure_compare decode);
 use Mojo::Promise;
-use Mojo::IOLoop::Subprocess;
 use Mojo::IOLoop;
+use Mojo::IOLoop::Subprocess;
 use Try::Tiny;
 use Net::CIDR;
-use Fcntl qw(:mode O_CREAT O_EXCL O_WRONLY O_RDWR :flock);
+use Fcntl qw(O_CREAT O_EXCL O_WRONLY O_RDWR :flock);
 use Time::HiRes qw(time sleep);
 use Text::ParseWords qw(shellwords);
 use File::Spec;
 
-use constant RELOAD_GRACE_S  => 0.35;
-use constant LOCK_TIMEOUT_S  => 3.0;
+use constant RELOAD_GRACE_S => 0.35;
+use constant LOCK_TIMEOUT_S => 3.0;
 
-sub _num_seconds {
-    my ($v, $default) = @_;
-    $default //= 0.35; 
-    # Erzwinge numerischen Kontext für den Default (verhindert den Fehler im Log)
-    my $fallback = $default + 0; 
-    
-    if (defined $v && $v =~ /\A\d+(?:\.\d+)?\z/) {
-        return $v + 0;
-    }
-    return $fallback;
-}
+our $VERSION = '1.6.6';
 
-
-our $VERSION = '1.6.0';
-
-# Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
 
-# -------------------- I/O Basis-Helfer --------------------
-sub read_raw {
-    my ($file) = @_;
-    my $data = eval { path($file)->slurp };
-    die "Kann $file nicht lesen: " . ($@ || $!) unless defined $data;
-    return $data;
+# -------------------- Mini helpers --------------------
+sub _trim { my $s = $_[0] // ''; $s =~ s/^\s+|\s+$//g; $s }
+sub _num_seconds { my ($v,$d)=@_; $d//=0.35; (defined $v && $v =~ /\A\d+(?:\.\d+)?\z/) ? ($v+0) : ($d+0) }
+sub _normalize_mode { my ($m)=@_; return unless defined $m; return oct($m) if "$m" =~ /^[0-7]{3,4}$/; return $m if "$m" =~ /^\d+$/; return }
+sub json_pretty { to_json($_[0], { pretty => 1, canonical => 1 }) }
+
+sub read_raw  { my $d = eval { path($_[0])->slurp };       die "Kann $_[0] nicht lesen: ".($@||$!) unless defined $d; $d }
+sub read_text { my $d = eval { path($_[0])->slurp('UTF-8')};die "Kann $_[0] nicht lesen: ".($@||$!) unless defined $d; $d }
+sub read_json_config { decode_json(read_text($_[0])) }
+
+sub _ts_log {
+    my $t = $_[0] // time;
+    my @lt = localtime($t);
+    sprintf('%04d/%02d/%02d %02d:%02d:%02d', $lt[5]+1900, $lt[4]+1, $lt[3], $lt[2], $lt[1], $lt[0]);
+}
+sub _ts_compact {
+    my $t = $_[0] // time;
+    my @lt = localtime($t);
+    sprintf('%04d%02d%02d_%02d%02d%02d', $lt[5]+1900, $lt[4]+1, $lt[3], $lt[2], $lt[1], $lt[0]);
 }
 
-sub read_text {
-    my ($file) = @_;
-    my $data = eval { path($file)->slurp('UTF-8') };
-    die "Kann $file nicht lesen: " . ($@ || $!) unless defined $data;
-    return $data;
+sub set_file_ownership_and_mode {
+    my ($p, $user, $group, $mode) = @_;
+    my $err = '';
+
+    if ($user || $group) {
+        my ($uid, $gid);
+        $uid = getpwnam($user)  if defined $user && $user ne '';
+        $gid = getgrnam($group) if defined $group && $group ne '';
+        if (defined($uid) || defined($gid)) {
+            chown(defined $uid ? $uid : -1, defined $gid ? $gid : -1, $p) or $err .= "chown $user:$group fehlgeschlagen: $!; ";
+        } else {
+            $err .= "unbekannter user/group ($user:$group); ";
+        }
+    }
+
+    if (defined(my $oct = _normalize_mode($mode))) {
+        chmod $oct, $p or $err .= "chmod ".sprintf('%04o',$oct)." fehlgeschlagen: $!; ";
+    }
+
+    return $err;
 }
 
-sub _normalize_mode {
-    my ($m) = @_;
-    return unless defined $m;
-    return oct($m) if "$m" =~ /^[0-7]{3,4}$/;  # "0644" -> 420
-    return $m if "$m" =~ /^\d+$/;              # 420 -> 420
-    return;
+sub ensure_dir {
+    my (%a) = @_;
+    my $dir  = $a{dir}  // '';
+    die "ensure_dir: empty dir" unless $dir;
+
+    unless (-d $dir) {
+        eval { path($dir)->make_path };
+        die "Kann Verzeichnis $dir nicht anlegen: $@" if $@;
+    }
+
+    my ($user,$grp,$mode) = @a{qw/user group mode/};
+    my $err = '';
+
+    my ($uid, $gid);
+    $uid = getpwnam($user) if defined $user && $user ne '';
+    $gid = getgrnam($grp)  if defined $grp  && $grp  ne '';
+
+    if (defined($uid) || defined($gid)) {
+        chown(defined $uid ? $uid : -1, defined $gid ? $gid : -1, $dir) or $err .= "chown $user:$grp auf $dir fehlgeschlagen: $!; ";
+    }
+
+    if (defined(my $oct = _normalize_mode($mode))) {
+        my $cur = (stat($dir))[2] & 07777;
+        if ($cur != $oct) { chmod($oct, $dir) or $err .= "chmod ".sprintf('%04o',$oct)." auf $dir fehlgeschlagen: $!; " }
+    }
+
+    return $err;
 }
 
-sub read_json_config {
-    my ($file) = @_;
-    my $text = read_text($file);
-    my $data = decode_json($text);
-    return $data;
-}
+# -------------------- Config --------------------
+my $home = app->home;
+my $global_cfg_file    = $home->rel_file('global.json');
+my $instances_cfg_file = $home->rel_file('configs.json');
+
+die "Missing config $global_cfg_file\n"    unless -f $global_cfg_file;
+die "Missing config $instances_cfg_file\n" unless -f $instances_cfg_file;
+
+my $global        = read_json_config($global_cfg_file);
+my $instances_raw = read_json_config($instances_cfg_file);
 
 sub _looks_like_instance_node {
     my ($h) = @_;
@@ -75,191 +115,32 @@ sub _looks_like_instance_node {
     }
     return 0;
 }
-
 sub wrap_instances_hash_if_needed {
     my ($insts) = @_;
     return $insts unless $insts && ref($insts) eq 'HASH';
-
-    # Wenn es bereits wie instances->{default} aussieht, nichts tun
     return $insts if exists $insts->{default};
-
-    # Wenn es wie eine Single-Instanz aussieht, als default wrappen
     return { default => $insts } if _looks_like_instance_node($insts);
-
     return $insts;
 }
 
-# -------------------- Config laden --------------------
-my $home = app->home;
-my $global_cfg_file    = $home->rel_file('global.json');
-my $instances_cfg_file = $home->rel_file('configs.json');
-die "Missing config $global_cfg_file\n"    unless -f $global_cfg_file;
-die "Missing config $instances_cfg_file\n" unless -f $instances_cfg_file;
-
-my $global        = read_json_config($global_cfg_file);
-my $instances_raw = read_json_config($instances_cfg_file);
-my $instances     = (ref($instances_raw->{instances}) eq 'HASH')
-                  ? $instances_raw->{instances}
-                  : $instances_raw;
-
-# Rueckwaerts kompatibel: Single-Format als default behandeln
+my $instances = (ref($instances_raw->{instances}) eq 'HASH') ? $instances_raw->{instances} : $instances_raw;
 $instances = wrap_instances_hash_if_needed($instances);
 
-# Harte Defaults fuer globale Berechtigungen (nur falls nicht gesetzt)
 $global->{serviceUser}      //= 'root';
 $global->{serviceGroup}     //= 'root';
-$global->{fileMode_service} //= '0644';  # Maps
-$global->{fileMode_backup}  //= '0660';  # Backups
+$global->{fileMode_service} //= '0644';
+$global->{fileMode_backup}  //= '0660';
 
-# Secret fuer Mojo (Session/Signer)
 app->secrets([ $global->{secret} // 'change-this-long-random-secret-please' ]);
 app->max_request_size(2 * 1024 * 1024);
 
-# -------------------- Logging vorbereiten --------------------
-my $logfile = $global->{logfile} // "/var/log/mmbb/postfix-agent.log";
-my $logdir  = path($logfile)->dirname->to_string;
-unless (-d $logdir) {
-    eval { path($logdir)->make_path };
-    die "Kann Log-Verzeichnis $logdir nicht anlegen: $@" if $@;
-}
-eval {
-    open my $lfh, '>>', $logfile or die $!;
-    close $lfh;
-    1;
-} or die "Kann Logfile $logfile nicht oeffnen: $@";
+my $config = { global => $global, instances => $instances };
 
-my $logger = Mojo::Log->new(path => $logfile, level => 'info');
+sub effective_service_user  { $global->{serviceUser} }
+sub effective_service_group { $global->{serviceGroup} }
+sub effective_file_mode     { $global->{fileMode_service} }
+sub effective_backup_mode   { $global->{fileMode_backup} // $global->{fileMode_service} }
 
-sub _ts_log {
-    my ($t) = @_;
-    $t //= time;
-    my @lt = localtime($t);
-    return sprintf('%04d/%02d/%02d %02d:%02d:%02d', $lt[5]+1900, $lt[4]+1, $lt[3], $lt[2], $lt[1], $lt[0]);
-}
-
-sub _ts_compact {
-    my ($t) = @_;
-    $t //= time;
-    my @lt = localtime($t);
-    return sprintf('%04d%02d%02d_%02d%02d%02d', $lt[5]+1900, $lt[4]+1, $lt[3], $lt[2], $lt[1], $lt[0]);
-}
-
-$logger->format(sub {
-    my ($time, $level, @lines) = @_;
-    my $ts  = _ts_log($time);
-    my $lvl = uc($level // 'info');
-    return join('', map { my $m = $_; chomp $m; "$ts $lvl $m\n" } @lines);
-});
-
-sub run_cmd_subprocess_p {
-    my ($cmd_str) = @_;
-    $cmd_str //= '';
-    $cmd_str =~ s/^\s+|\s+$//g;
-
-    my @cmd = shellwords($cmd_str);
-    return Mojo::Promise->reject('empty command') unless @cmd;
-
-    my $p  = Mojo::Promise->new;
-    my $sp = Mojo::IOLoop::Subprocess->new;
-
-    $sp->run(
-        sub {
-            my ($subproc) = @_;
-
-            # STDERR auf STDOUT umleiten, damit wir beides einfangen
-            open(local *STDERR, ">&", STDOUT) or die "Can't dup STDOUT: $!";
-
-            # KEINE Shell-Interpretation von ; | & etc.
-            open(my $fh, "-|", @cmd) or die "Can't execute @cmd: $!";
-
-            my $output = do { local $/; <$fh> };
-            close($fh);
-            my $rc = $? >> 8;
-
-            return { rc => $rc, output => $output // '' };
-        },
-        sub {
-            my ($subproc, $err, $res) = @_;
-            return $p->reject($err) if $err;
-            return $p->resolve($res);
-        }
-    );
-
-    return $p;
-}
-
-sub run_promise {
-    my ($c, $cb) = @_;
-    $c->render_later;
-
-    return Mojo::Promise->resolve
-        ->then(sub { $cb->(); })
-        ->catch(sub {
-            my ($err) = @_;
-            $err = "$err";
-            $logger->error("Unhandled error: $err");
-            $c->render(status => 500, json => { ok => 0, error => 'Internal error' });
-        });
-}
-
-# -------------------- FS-Rechte & Ownership --------------------
-sub set_file_ownership_and_mode {
-    my ($path, $user, $group, $mode) = @_;
-    my $err = '';
-
-    if ($user || $group) {
-        my ($uid, $gid);
-        $uid = getpwnam($user)  if defined $user && $user ne '';
-        $gid = getgrnam($group) if defined $group && $group ne '';
-        if (defined($uid) || defined($gid)) {
-            chown(defined $uid ? $uid : -1, defined $gid ? $gid : -1, $path)
-                or $err .= "chown $user:$group fehlgeschlagen: $!; ";
-        } else {
-            $err .= "unbekannter user/group ($user:$group); ";
-        }
-    }
-
-    if (defined(my $oct_mode = _normalize_mode($mode))) {
-        chmod $oct_mode, $path
-            or $err .= "chmod " . sprintf('%04o',$oct_mode) . " fehlgeschlagen: $!; ";
-    }
-
-    return $err;
-}
-
-sub set_dir_ownership_and_mode {
-    my ($dir, $user, $group, $mode) = @_;
-    my $err = '';
-    my ($uid, $gid);
-
-    $uid = getpwnam($user)  if defined $user && $user ne '';
-    $gid = getgrnam($group) if defined $group && $group ne '';
-    if (defined($uid) || defined($gid)) {
-        chown(defined $uid ? $uid : -1, defined $gid ? $gid : -1, $dir)
-            or $err .= "chown $user:$group auf $dir fehlgeschlagen: $!; ";
-    }
-
-    if (defined(my $oct_mode = _normalize_mode($mode))) {
-        my $cur = (stat($dir))[2] & 07777;
-        unless ($cur == $oct_mode) {
-            chmod($oct_mode, $dir)
-                or $err .= "chmod " . sprintf('%04o',$oct_mode) . " auf $dir fehlgeschlagen: $!; ";
-        }
-    }
-
-    return $err;
-}
-
-# Logfile-Owner/Group nachziehen
-eval { set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup}); 1; };
-
-# Nur globale Berechtigungen verwenden
-sub effective_service_user   { return $global->{serviceUser}; }
-sub effective_service_group  { return $global->{serviceGroup}; }
-sub effective_file_mode      { return $global->{fileMode_service}; }
-sub effective_backup_mode    { return $global->{fileMode_backup} // $global->{fileMode_service}; }
-
-# Backup-Fallback: backupDir/<inst>
 sub effective_backup_dir {
     my ($ci, $inst) = @_;
     return $ci->{backup_dir} if $ci && $ci->{backup_dir};
@@ -267,188 +148,116 @@ sub effective_backup_dir {
     return;
 }
 
-# Globale Dienstverzeichnisse anlegen/absichern
+# -------------------- Logging + dirs --------------------
+my $logfile = $global->{logfile} // "/var/log/mmbb/postfix-agent.log";
+my $logdir  = path($logfile)->dirname->to_string;
+ensure_dir(dir => $logdir) unless -d $logdir;
+
+eval { open(my $lfh, '>>', $logfile) or die $!; close $lfh; 1; } or die "Kann Logfile $logfile nicht oeffnen: $@";
+
+my $logger = Mojo::Log->new(path => $logfile, level => 'info');
+$logger->format(sub {
+    my ($time, $level, @lines) = @_;
+    my $ts  = _ts_log($time);
+    my $lvl = uc($level // 'info');
+    join('', map { my $m = $_; chomp $m; "$ts $lvl $m\n" } @lines);
+});
+eval { set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup}); 1; };
+
 if (my $dconf = $global->{dirs}) {
     my $folders = $dconf->{service_folder};
     $folders = [$folders] unless ref $folders eq 'ARRAY';
-    my $owner = $global->{serviceUser};
-    my $group = $global->{serviceGroup};
-    my $mode  = $global->{dirs}{service_mode};
-
-    foreach my $fldkey (@$folders) {
+    for my $fldkey (@$folders) {
         my $dir = $global->{$fldkey} // next;
-        unless (-d $dir) {
-            eval { path($dir)->make_path };
-            die "Kann Verzeichnis $dir nicht anlegen: $@" if $@;
-        }
-        my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
-        $logger->warn($err) if $err;
+        my $e = ensure_dir(dir=>$dir, user=>$global->{serviceUser}, group=>$global->{serviceGroup}, mode=>$global->{dirs}{service_mode});
+        $logger->warn($e) if $e;
     }
 }
 
-# Instanz-Backupverzeichnisse sicherstellen
-{
-    my $owner = $global->{serviceUser};
-    my $group = $global->{serviceGroup};
-    my $mode  = $global->{dirs}{service_mode};
-
-    for my $name (keys %$instances) {
-        my $dir = effective_backup_dir($instances->{$name}, $name) // next;
-        unless (-d $dir) {
-            eval { path($dir)->make_path };
-            if ($@) { $logger->error("Backup-Verzeichnis $dir konnte nicht erstellt werden: $@"); next; }
-        }
-        my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
-        $logger->warn($err) if $err;
-    }
+for my $name (keys %$instances) {
+    my $ci  = $instances->{$name};
+    my $dir = effective_backup_dir($ci, $name) // next;
+    my $e = ensure_dir(dir=>$dir, user=>$global->{serviceUser}, group=>$global->{serviceGroup}, mode=>$global->{dirs}{service_mode});
+    $logger->warn($e) if $e;
 }
 
-# tmp-dir
 my $tmp_dir = $global->{tmpDir} // '/tmp';
-unless (-d $tmp_dir) {
-    eval { path($tmp_dir)->make_path };
-    die "Konnte tmp_dir $tmp_dir nicht anlegen: $@" if $@;
-}
+ensure_dir(dir => $tmp_dir) unless -d $tmp_dir;
 
-# Zusammengefuehrte Config (mutable via reload_config / _rebuild_cfgmap_from)
-my $config = { global => $global, instances => $instances };
-
-# -------------------- Atomare Writes --------------------
+# -------------------- Atomic write --------------------
 sub _atomic_write_impl {
     my ($target, $content, $user, $group, $mode, $umask_only) = @_;
-
     my $dir = path($target)->dirname->to_string;
     die "Verzeichnis nicht beschreibbar: $dir" unless -w $dir;
 
     my $tmpfile;
-    my $max_tries = 128;
-
-    for (1..$max_tries) {
+    for (1..128) {
         my $rand = int(rand(1_000_000_000));
-        my $candidate = path($dir)->child(".tmp_${$}_$rand")->to_string;
-
-        if (sysopen(my $fh, $candidate, O_CREAT|O_EXCL|O_WRONLY, 0666)) {
+        my $cand = path($dir)->child(".tmp_${$}_$rand")->to_string;
+        if (sysopen(my $fh, $cand, O_CREAT|O_EXCL|O_WRONLY, 0666)) {
             binmode($fh, ':encoding(UTF-8)');
             print $fh $content;
-            close $fh or die "close($candidate) failed: $!";
-            $tmpfile = $candidate;
+            close $fh or die "close($cand) failed: $!";
+            $tmpfile = $cand;
             last;
         }
     }
-
     die "atomic_write: konnte keine Temp-Datei erstellen in $dir" unless $tmpfile;
 
-    if ($umask_only) {
-        set_file_ownership_and_mode($tmpfile, $user, $group);
-    } else {
-        set_file_ownership_and_mode($tmpfile, $user, $group, $mode);
-    }
+    $umask_only ? set_file_ownership_and_mode($tmpfile, $user, $group)
+               : set_file_ownership_and_mode($tmpfile, $user, $group, $mode);
 
     rename $tmpfile, $target or die "rename($tmpfile -> $target) failed: $!";
 
-    if ($umask_only) {
-        set_file_ownership_and_mode($target, $user, $group);
-    } else {
-        set_file_ownership_and_mode($target, $user, $group, $mode);
-    }
+    $umask_only ? set_file_ownership_and_mode($target, $user, $group)
+               : set_file_ownership_and_mode($target, $user, $group, $mode);
 
-    return 1;
+    1;
 }
+sub atomic_write       { _atomic_write_impl($_[0],$_[1],$_[2],$_[3],$_[4],0) }
+sub atomic_write_umask { _atomic_write_impl($_[0],$_[1],$_[2],$_[3],undef,1) }
 
-sub atomic_write {
-    my ($path, $content, $user, $group, $mode) = @_;
-    return _atomic_write_impl($path, $content, $user, $group, $mode, 0);
-}
-
-sub atomic_write_umask {
-    my ($path, $content, $user, $group) = @_;
-    return _atomic_write_impl($path, $content, $user, $group, undef, 1);
-}
-
-sub normalize_inst {
-    my ($inst) = @_;
-    $inst = '' unless defined $inst;
-    $inst =~ s/^\s+|\s+$//g;
-    return $inst;
-}
-
-# Instanz-Aufloesung analog zur alten Logik:
-# - Wenn Instanz angegeben: verwenden (Unknown -> spaeter 404)
-# - Wenn Instanz fehlt oder "default" ist und es genau 1 Instanz gibt: diese eine nehmen
-# - Wenn Instanz fehlt und mehrere existieren: Fehler (Instance required)
+# -------------------- Instance selection --------------------
+sub normalize_inst { my $i = $_[0]; $i = '' unless defined $i; $i =~ s/^\s+|\s+$//g; $i }
 sub resolve_inst_name {
-    my ($inst_in) = @_;
-    my $inst = normalize_inst($inst_in);
-
+    my $inst = normalize_inst($_[0]);
     my @names = sort keys %{ $config->{instances} // {} };
-
-    if ($inst eq '') {
-        return $names[0] if @names == 1;
-        return '';
-    }
-
-    if ($inst eq 'default' && !exists $config->{instances}{default} && @names == 1) {
-        return $names[0];
-    }
-
+    return $names[0] if $inst eq '' && @names == 1;
+    return ''        if $inst eq '';
+    return $names[0] if $inst eq 'default' && !exists $config->{instances}{default} && @names == 1;
     return $inst;
 }
-
 sub get_instance_or_render {
     my ($c, $inst_in) = @_;
     my $inst = resolve_inst_name($inst_in);
-
-    if (!defined $inst || $inst eq '') {
-        $c->render(status => 400, json => { ok => 0, error => 'Instance required' });
-        return;
-    }
-
+    return ($c->render(status=>400, json=>{ok=>0,error=>'Instance required'}), undef, undef) unless $inst;
     my $ci = $config->{instances}{$inst};
-    unless ($ci) {
-        $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' });
-        return;
-    }
-
-    return ($inst, $ci);
+    return ($c->render(status=>404, json=>{ok=>0,error=>'Unknown instance'}), undef, undef) unless $ci;
+    return (undef, $inst, $ci);
 }
 
-# Status-Parser (systemctl, postmulti, postfix-script)
+# -------------------- Status parse --------------------
 sub parse_service_status {
     my ($out, $rc) = @_;
+    my $t = lc($out // '');
+    $t =~ s/\r//g; $t =~ s/^\s+|\s+$//g;
 
-    my $txt = lc(($out // ''));
-    $txt =~ s/\r//g;
-    $txt =~ s/^\s+|\s+$//g;
+    return (defined $rc && $rc == 0) ? 'unknown-ok' : 'unknown-fail' if $t eq '';
+    return 'running' if $t =~ /\b(active|running)\b/;
+    return 'running' if $t =~ /\bpid:\s*\d+\b/;
+    return 'running' if $t =~ /\bpostfix\s+mail\s+system\s+is\s+running\b/;
 
-    if ($txt eq '') {
-        return (defined $rc && $rc == 0) ? 'unknown-ok' : 'unknown-fail';
-    }
-
-    return 'running' if $txt =~ /\bis\s+running\b/;
-    return 'running' if $txt =~ /\bthe\s+postfix\s+mail\s+system\s+is\s+running\b/;
-    return 'running' if $txt =~ /\bpid:\s*\d+\b/;
-    return 'running' if $txt =~ /[\w\-\.\/]+:\s*(?:the\s+postfix\s+mail\s+system\s+is\s+)?running\b/;
-    return 'running' if $txt =~ /\bactive\b/;
-
-    if ($txt =~ /\bnot\s+running\b/
-        || $txt =~ /\binactive\b/
-        || $txt =~ /\bstopp?ed\b/
-        || $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/) {
-
+    if ($t =~ /\b(not\s+running|inactive|dead|failed|stopp?ed)\b/) {
         return 'unknown-ok' if defined $rc && $rc == 0;
         return 'stopped';
     }
 
-    return 'stopped' if $txt =~ /\bdead\b/;
-    return 'stopped' if $txt =~ /\bfailed\b/;
-
     return 'running' if defined $rc && $rc == 0;
     return 'stopped' if defined $rc && $rc == 1;
-
     return 'unknown-fail';
 }
 
-# -------------------- Netz & Auth --------------------
+# -------------------- Auth + CORS --------------------
 my $listen_addr   = $config->{global}{listen}        // '0.0.0.0:5000';
 my $ssl_enable    = $config->{global}{ssl_enable}    // 0;
 my $ssl_cert      = $config->{global}{ssl_cert_file} // '';
@@ -456,8 +265,7 @@ my $ssl_key       = $config->{global}{ssl_key_file}  // '';
 my $require_https = $config->{global}{require_https} // 0;
 
 my $api_token = $ENV{API_TOKEN} // ($global->{api_token} // '');
-die "FATAL: API_TOKEN nicht gesetzt (ENV API_TOKEN oder global.json api_token)\n"
-    unless defined $api_token && length $api_token;
+die "FATAL: API_TOKEN nicht gesetzt (ENV API_TOKEN oder global.json api_token)\n" unless defined $api_token && length $api_token;
 
 hook before_dispatch => sub {
     my $c = shift;
@@ -472,206 +280,95 @@ hook before_dispatch => sub {
     $c->res->headers->header('Access-Control-Max-Age'       => '86400');
     $c->res->headers->header('Vary'                         => 'Origin');
 
-    if ($c->req->method eq 'OPTIONS') {
-        return $c->render(text => '', status => 204);
-    }
+    return $c->render(text => '', status => 204) if $c->req->method eq 'OPTIONS';
 
     if ($require_https) {
         my $is_https = ($c->req->url->to_abs->scheme // '') eq 'https' || ($c->req->is_secure // 0);
-        unless ($is_https) {
-            return $c->render(status => 403, json => { ok => 0, error => 'HTTPS required' });
-        }
+        return $c->render(status => 403, json => { ok => 0, error => 'HTTPS required' }) unless $is_https;
     }
 
-    unless (Net::CIDR::cidrlookup($c->tx->remote_address, @acl_rt)) {
-        return $c->render(status => 403, json => { ok => 0, error => 'Forbidden' });
-    }
+    return $c->render(status => 403, json => { ok => 0, error => 'Forbidden' })
+      unless Net::CIDR::cidrlookup($c->tx->remote_address, @acl_rt);
 
     my $hdr_token = $c->req->headers->header('X-API-Token') // '';
     my $bearer    = ($c->req->headers->authorization // '') =~ /^Bearer\s+(.+)/i ? $1 : '';
     my $token     = $hdr_token || $bearer;
 
-    unless (secure_compare($token, $api_token)) {
-        return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
-    }
+    return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' })
+      unless secure_compare($token, $api_token);
 };
 
-# -------------------- JSON Helpers (canonical + pretty) --------------------
-sub _json_canonicalize {
-    my ($v) = @_;
-    return $v unless ref $v;
-
-    if (ref $v eq 'HASH') {
-        my %out;
-        for my $k (sort keys %$v) {
-            $out{$k} = _json_canonicalize($v->{$k});
-        }
-        return \%out;
-    }
-    if (ref $v eq 'ARRAY') {
-        return [ map { _json_canonicalize($_) } @$v ];
-    }
-    return $v;
-}
-
-sub _json_pretty {
-    my ($json) = @_;
-    my $out = '';
-    my $indent = 0;
-    my $in_str = 0;
-    my $esc = 0;
-
-    my $nl = "\n";
-    my $sp = '  ';
-
-    for (my $i = 0; $i < length($json); $i++) {
-        my $ch = substr($json, $i, 1);
-
-        if ($in_str) {
-            $out .= $ch;
-            if ($esc) { $esc = 0; next; }
-            if ($ch eq "\\") { $esc = 1; next; }
-            if ($ch eq '"') { $in_str = 0; next; }
-            next;
-        }
-
-        if ($ch eq '"') { $in_str = 1; $out .= $ch; next; }
-        if ($ch =~ /\s/) { next; }
-
-        if ($ch eq '{' || $ch eq '[') {
-            $out .= $ch . $nl;
-            $indent++;
-            $out .= ($sp x $indent);
-            next;
-        }
-        if ($ch eq '}' || $ch eq ']') {
-            $out .= $nl;
-            $indent-- if $indent > 0;
-            $out .= ($sp x $indent) . $ch;
-            next;
-        }
-        if ($ch eq ',') {
-            $out .= $ch . $nl . ($sp x $indent);
-            next;
-        }
-        if ($ch eq ':') {
-            $out .= $ch . ' ';
-            next;
-        }
-
-        $out .= $ch;
-    }
-
-    $out .= $nl unless $out =~ /\n\z/;
-    return $out;
-}
-
-sub json_encode_pretty_canonical {
-    my ($data) = @_;
-    my $canon = _json_canonicalize($data);
-    my $min   = encode_json($canon);
-    return _json_pretty($min);
-}
-
-# -------------------- Config-Helfer (reload & raw read/write) ----------------
-sub reload_config {
-    my $raw_global    = decode_json( read_text($global_cfg_file) );
-    my $raw_instances = decode_json( read_text($instances_cfg_file) );
-
-    $raw_global->{serviceUser}      //= 'root';
-    $raw_global->{serviceGroup}     //= 'root';
-    $raw_global->{fileMode_service} //= '0644';
-    $raw_global->{fileMode_backup}  //= '0660';
-
-    my $inst_hash =
-        (ref($raw_instances->{instances}) eq 'HASH') ? $raw_instances->{instances}
-                                                     : $raw_instances;
-
-    $global    = $raw_global;
-    $instances = wrap_instances_hash_if_needed($inst_hash);
-    $config    = { global => $global, instances => $instances };
-}
-
-sub _read_cfg_hash {
-    my $cfg = decode_json( read_text($instances_cfg_file) );
-    return $cfg;
-}
-
-sub _inst_node_rw {
+# -------------------- configs.json helpers --------------------
+sub cfg_load { decode_json(read_text($instances_cfg_file)) }
+sub cfg_node {
     my ($cfg, $inst) = @_;
-    my $node = (ref($cfg->{instances}) eq 'HASH') ? ($cfg->{instances}{$inst} //= {}) : ($cfg->{$inst} //= {});
-    return $node;
+    (ref($cfg->{instances}) eq 'HASH') ? ($cfg->{instances}{$inst} //= {}) : ($cfg->{$inst} //= {});
 }
-
-sub _write_cfg_hash_atomic {
-    my ($cfg) = @_;
-    my $json = json_encode_pretty_canonical($cfg);
-    atomic_write_umask($instances_cfg_file, $json, $global->{serviceUser}, $global->{serviceGroup});
-}
-
-sub _rebuild_cfgmap_from {
+sub cfg_save { atomic_write_umask($instances_cfg_file, json_pretty($_[0]), $global->{serviceUser}, $global->{serviceGroup}) }
+sub cfg_rebuild_instances {
     my ($cfg) = @_;
     my $insts = (ref($cfg->{instances}) eq 'HASH') ? $cfg->{instances} : $cfg;
     $insts = wrap_instances_hash_if_needed($insts);
     $instances = $insts;
     $config->{instances} = $insts;
+    for my $n (keys %{$config->{instances}}) { delete @{$config->{instances}{$n}}{qw(_glob_re_cache _glob_re_order)} }
 }
 
-# -------------------- Map-Typen & Sanitizer --------------------
+# -------------------- Sanitizer + glob --------------------
 my %GLOB_TYPES = map { $_ => 1 } qw(regexp pcre cidr lmdb hash btree db);
+my %FORBIDDEN  = map { $_ => 1 } qw(main.cf master.cf);
+sub deny_forbidden_map { $FORBIDDEN{ lc($_[0] // '') } ? 1 : 0 }
 
-sub sanitize_map_name {
-    my ($raw) = @_;
-    my $name = path($raw // '')->basename;
-    return (undef, 'Empty name') unless defined $name && length $name;
+sub sanitize_generic {
+    my (%a) = @_;
+    my $v = $a{basename} ? path($a{raw} // '')->basename : ($a{raw} // '');
+    $v = _trim($v);
 
-    return (undef, 'Invalid characters') unless $name =~ /\A[0-9A-Za-z._-]{1,255}\z/;
-    return (undef, 'Path traversal detected') if $name =~ /\A\.+\z/;
-    return (undef, 'Path traversal detected') if $name =~ m{[\\/]} || $name =~ /\.\./;
+    return (undef, "Empty") unless length $v;
+    return (undef, "Invalid characters") unless $v =~ $a{re_ok};
 
-    return ($name, undef);
+    if ($a{no_path})  { return (undef, "Path traversal detected") if $v =~ /\A\.+\z/ || $v =~ m{[\\/]} || $v =~ /\.\./ }
+    if ($a{no_slash}) { return (undef, "Path traversal detected") if $v =~ m{/|\\|\.\.} }
+
+    $v = lc($v) if $a{lower};
+    return ($v, undef);
 }
 
-my %FORBIDDEN = map { $_ => 1 } qw(main.cf master.cf);
+sub sanitize_map_name { sanitize_generic(raw=>$_[0], basename=>1, re_ok=>qr/\A[0-9A-Za-z._-]{1,255}\z/, no_path=>1) }
+sub sanitize_glob_key { sanitize_generic(raw=>$_[0], re_ok=>qr/\A[0-9A-Za-z._*\-]{1,255}\z/, no_slash=>1) }
+sub sanitize_glob_val { sanitize_generic(raw=>$_[0], re_ok=>qr/\A[a-z0-9_\-]{1,32}\z/i, lower=>1) }
 
-sub _deny_forbidden_map {
-    my ($name) = @_;
-    return $FORBIDDEN{ lc $name };
+sub _compile_glob_to_re { my $g=$_[0]; (my $r=$g)=~s/\./\\./g; $r=~s/\*/.*/g; qr/^$r$/ }
+sub _ensure_glob_cache {
+    my ($ci) = @_;
+    return if $ci->{_glob_re_cache};
+    my $gl = ($ci->{globs} && ref($ci->{globs}) eq 'HASH') ? $ci->{globs} : {};
+    my (%cache,@order);
+    for my $k (keys %$gl) {
+        next unless defined $k && length $k;
+        next unless $k =~ /\*/;
+        $cache{$k} = _compile_glob_to_re($k);
+        push @order, $k;
+    }
+    $ci->{_glob_re_cache} = \%cache;
+    $ci->{_glob_re_order} = \@order;
 }
-
-sub sanitize_glob_key {
-    my ($raw) = @_;
-    my $k = $raw // '';
-    $k =~ s/^\s+|\s+$//g;
-    return (undef, 'Empty key') unless length $k;
-    return (undef, 'Invalid characters') unless $k =~ /\A[0-9A-Za-z._*\-]{1,255}\z/;
-    return (undef, 'Path traversal detected') if $k =~ m{/|\\|\.\.};
-    return ($k, undef);
-}
-
-sub sanitize_glob_val {
-    my ($v) = @_;
-    $v //= '';
-    $v =~ s/^\s+|\s+$//g;
-    return (undef, 'Empty value') unless length $v;
-    return (undef, 'Invalid value') unless $v =~ /\A[a-z0-9_\-]{1,32}\z/i;
-    return (lc($v), undef);
-}
-
 sub map_type_for_file {
     my ($ci, $file) = @_;
     my $globs = $ci->{globs} // {};
     return $globs->{$file} if exists $globs->{$file};
-    for my $glob (keys %$globs) {
-        next if $glob eq $file;
-        my $type = $globs->{$glob};
-        (my $re = $glob) =~ s/\./\\./g; $re =~ s/\*/.*/g;
-        return $type if $file =~ /^$re$/;
+
+    _ensure_glob_cache($ci);
+    my $cache = $ci->{_glob_re_cache} // {};
+    my $order = $ci->{_glob_re_order} // [];
+    for my $glob (@$order) {
+        my $re = $cache->{$glob} or next;
+        return $globs->{$glob} if $file =~ $re;
     }
     return;
 }
 
-# -------------------- Kommandoplaetze --------------------
+# -------------------- Commands + backup --------------------
 sub expand_cmd {
     my ($ci, $inst, $cmd) = @_;
     return '' unless defined $cmd && length $cmd;
@@ -680,77 +377,117 @@ sub expand_cmd {
     $cmd =~ s/\{config_dir\}/$ci->{config_dir}/g;
     $cmd =~ s/\{map_dir\}/$ci->{map_dir}/g;
     $cmd =~ s/\{backup_dir\}/$bdir/g;
-    return $cmd;
+    $cmd;
 }
-
 sub postmap_cmd {
     my ($ci, $file, $inst) = @_;
     my $type = map_type_for_file($ci, $file) or return;
-    my $template = $ci->{postmap_by_type}{$type} or return;
-    my $path = "$ci->{map_dir}/$file"; $path =~ s{//+}{/}g;
-    my $cmd = $template;
-    $cmd =~ s/\{config_dir\}/$ci->{config_dir}/g;
-    $cmd =~ s/\{path\}/$path/g;
+    my $tmpl = $ci->{postmap_by_type}{$type} or return;
+    my $p = "$ci->{map_dir}/$file"; $p =~ s{//+}{/}g;
+    (my $cmd = $tmpl) =~ s/\{config_dir\}/$ci->{config_dir}/g;
+    $cmd =~ s/\{path\}/$p/g;
     $cmd =~ s/\{inst\}/$inst/g;
-    return $cmd;
+    $cmd;
 }
-
-# -------------------- Backups --------------------
 sub backup_file {
-    my ($file, $dir, $max, $ci) = @_;
-    $logger->info("backup_file: file=$file dir=$dir max=$max");
-    unless (-f $file) { $logger->error("Kein Backup, da Datei $file nicht existiert."); return; }
+    my ($file, $dir, $max) = @_;
+    return unless -f $file;
 
-    unless (-d $dir) {
-        $logger->warn("Backup-Verzeichnis $dir nicht vorhanden, wird angelegt.");
-        eval { path($dir)->make_path };
-        if ($@) { $logger->error("Backup-Verzeichnis $dir konnte nicht erstellt werden: $@"); return; }
-        my $err = set_dir_ownership_and_mode($dir, $global->{serviceUser}, $global->{serviceGroup}, $global->{dirs}{service_mode});
-        $logger->warn("set_dir_ownership_and_mode($dir): $err") if $err;
-    }
+    my $e = ensure_dir(dir=>$dir, user=>$global->{serviceUser}, group=>$global->{serviceGroup}, mode=>$global->{dirs}{service_mode});
+    $logger->warn($e) if $e;
 
-    my $ts  = _ts_compact();
-    my $dst = "$dir/" . path($file)->basename . ".bak.$ts";
-    $logger->info("Erstelle Backup von $file nach $dst");
-
+    my $dst = "$dir/" . path($file)->basename . ".bak." . _ts_compact();
     try {
-        my $data = path($file)->slurp;
-        path($dst)->spew($data);
-
-        my $bk_mode = effective_backup_mode();
-        my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
-        $logger->error("Fehler bei set_file_ownership_and_mode ($dst): $err") if $err;
+        path($dst)->spew(path($file)->slurp);
+        my $bm = effective_backup_mode();
+        my $er = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bm);
+        $logger->warn($er) if $er;
     } catch {
         $logger->error("Backup fehlgeschlagen: $_");
         return;
     };
 
-    my @bak = glob "$dir/" . path($file)->basename . ".bak.*";
-    @bak = sort { (stat($a))[9] <=> (stat($b))[9] } @bak;
-    if ($max && @bak > $max) {
-        my $to_delete = @bak - $max;
-        for my $del (@bak[0 .. $to_delete-1]) {
-            unlink $del or $logger->warn("Konnte altes Backup nicht loeschen: $del ($!)");
-        }
-    }
+    return unless $max;
+    my @bak = sort { (stat($a))[9] <=> (stat($b))[9] } glob("$dir/" . path($file)->basename . ".bak.*");
+    my $to_delete = @bak - $max;
+    for my $del (@bak[0 .. $to_delete-1]) { unlink $del or $logger->warn("Konnte altes Backup nicht loeschen: $del ($!)") }
 }
 
-# -------------------- Locks (per Map & Instanz) --------------------
+# -------------------- Promise wrapper + subprocess --------------------
+sub run_promise {
+    my ($c, $cb) = @_;
+    $c->render_later;
+    Mojo::Promise->resolve->then(sub { $cb->() })->catch(sub {
+        my ($err) = @_;
+        $logger->error("Unhandled error: $err");
+        $c->render(status => 500, json => { ok => 0, error => 'Internal error' });
+    });
+}
+
+sub run_cmd_subprocess_p {
+    my ($cmd_str) = @_;
+    $cmd_str //= '';
+    $cmd_str =~ s/^\s+|\s+$//g;
+
+    my @cmd = shellwords($cmd_str);
+    return Mojo::Promise->reject('empty command') unless @cmd;
+
+    my $p  = Mojo::Promise->new;
+    my $sp = Mojo::IOLoop::Subprocess->new;
+
+    $sp->run(
+        sub {
+            open(local *STDERR, ">&", STDOUT) or die "Can't dup STDOUT: $!";
+            open(my $fh, "-|", @cmd) or die "Can't execute @cmd: $!";
+            my $output = do { local $/; <$fh> };
+            close($fh);
+            my $rc = $? >> 8;
+            return { rc => $rc, output => $output // '' };
+        },
+        sub {
+            my ($subproc, $err, $res) = @_;
+            return $p->reject($err) if $err;
+            return $p->resolve($res);
+        }
+    );
+
+    $p;
+}
+
+sub run_cmd_into_result_p {
+    my (%a) = @_;
+    my $cmd   = $a{cmd}   // '';
+    my $slot  = $a{slot}  // {};
+    my $mode  = $a{mode}  // 'strict';
+    my $label = $a{label} // 'cmd';
+
+    return Mojo::Promise->resolve(1) unless $cmd;
+
+    run_cmd_subprocess_p($cmd)->then(sub {
+        my ($r) = @_;
+        my $rc  = $r->{rc} // 255;
+        my $out = $r->{output} // '';
+
+        %$slot = (executed=>1, command=>$cmd, rc=>$rc, output=>$out, result=>($rc==0?'ok':'fail'));
+
+        if ($mode eq 'warn' && $rc != 0) { $slot->{result}='warn'; $slot->{warning}="$label rc=$rc (will verify via status)"; return 1 }
+        die "$label rc=$rc: $out" if $rc != 0;
+        1;
+    })->catch(sub {
+        my ($e) = @_;
+        %$slot = ( executed => 1, result => 'fail', error => "$e" );
+        1;
+    });
+}
+
+# -------------------- Locks --------------------
 sub _lock_dir_for {
     my ($ci, $inst) = @_;
     $inst = normalize_inst($inst);
-
     return $ci->{lock_dir} if $ci && $ci->{lock_dir};
     return $config->{global}{lockDir} if $config->{global}{lockDir};
-
     my $base = $config->{global}{tmpDir} // '/tmp';
-    return File::Spec->catdir($base, 'postfix-agent-locks', $inst);
-}
-
-sub _map_lock_path {
-    my ($ci, $inst, $map) = @_;
-    my $ldir = _lock_dir_for($ci, $inst);
-    return path($ldir, "$map.lock")->to_string;
+    File::Spec->catdir($base, 'postfix-agent-locks', $inst);
 }
 
 sub with_map_lock {
@@ -758,39 +495,36 @@ sub with_map_lock {
     $inst = normalize_inst($inst);
 
     my $ldir = _lock_dir_for($ci, $inst);
-    unless (-d $ldir) {
-        path($ldir)->make_path;
-        my $mode = $config->{global}{dirs}{service_mode};
-        my $err = set_dir_ownership_and_mode($ldir, $config->{global}{serviceUser}, $config->{global}{serviceGroup}, $mode);
-        $logger->warn("Lockdir perms: $err") if $err;
+    my $e = ensure_dir(dir=>$ldir, user=>$config->{global}{serviceUser}, group=>$config->{global}{serviceGroup}, mode=>$config->{global}{dirs}{service_mode});
+    $logger->warn($e) if $e;
+
+    my $lpath = path($ldir, "$map.lock")->to_string;
+
+    my $newfile = 0;
+    if (!-e $lpath) {
+        $newfile = 1;
+        sysopen(my $tfh, $lpath, O_CREAT|O_EXCL|O_WRONLY, 0660) or $newfile = 0;
+        close $tfh if $newfile;
     }
 
-    my $lpath = _map_lock_path($ci, $inst, $map);
-    sysopen(my $lfh, $lpath, O_RDWR|O_CREAT, 0660)
-        or die "Lockfile open failed $lpath: $!";
-
-    my $e = set_file_ownership_and_mode($lpath, $config->{global}{serviceUser}, $config->{global}{serviceGroup});
-    $logger->warn("Lockfile chown/chmod: $e") if $e;
+    sysopen(my $lfh, $lpath, O_RDWR|O_CREAT, 0660) or die "Lockfile open failed $lpath: $!";
+    if ($newfile) {
+        my $er = set_file_ownership_and_mode($lpath, $config->{global}{serviceUser}, $config->{global}{serviceGroup});
+        $logger->warn("Lockfile chown/chmod: $er") if $er;
+    }
 
     my $want = $exclusive ? LOCK_EX : LOCK_SH;
     my $t0 = time;
 
     while (1) {
         if (flock($lfh, $want | LOCK_NB)) {
-            my $ret; my $err;
+            my ($ret, $err);
             eval { $ret = $code->(); 1 } or $err = $@;
 
             if (!$err && $ret && ref($ret) && eval { $ret->isa('Mojo::Promise') }) {
                 my $p = Mojo::Promise->new;
-                $ret->then(sub {
-                    my (@v) = @_;
-                    flock($lfh, LOCK_UN); close $lfh;
-                    $p->resolve(@v);
-                })->catch(sub {
-                    my ($e) = @_;
-                    flock($lfh, LOCK_UN); close $lfh;
-                    $p->reject($e);
-                });
+                $ret->then(sub { flock($lfh, LOCK_UN); close $lfh; $p->resolve(@_) })
+                    ->catch(sub { flock($lfh, LOCK_UN); close $lfh; $p->reject($_[0]) });
                 return $p;
             }
 
@@ -799,790 +533,522 @@ sub with_map_lock {
             return $ret;
         }
 
-        if ((time - $t0) > LOCK_TIMEOUT_S()) {
-            close $lfh;
-            die "Lock-Timeout ($map)";
-        }
-
+        if ((time - $t0) > LOCK_TIMEOUT_S()) { close $lfh; die "Lock-Timeout ($map)" }
         sleep 0.05;
     }
 }
 
-# -------------------- Status Check Helper (Save/Restore identisch) --------------------
+# -------------------- Status verify + apply engine --------------------
 sub _status_verify_p {
     my ($ci, $inst, $result) = @_;
-
-    my $p = Mojo::Promise->resolve;
-
-    # kleiner Grace bevor wir den Status abfragen (Systemd/Postfix braucht manchmal einen Tick)
     my $grace = _num_seconds($config->{global}{reload_grace_s}, RELOAD_GRACE_S());
-    $p = $p->then(sub {
+    my $status_cmd = expand_cmd($ci, $inst, $ci->{status_cmd} // '');
+
+    Mojo::Promise->resolve(1)->then(sub {
         my $t = Mojo::Promise->new;
         Mojo::IOLoop->timer($grace => sub { $t->resolve(1) });
-        return $t;
-    });
+        $t;
+    })->then(sub {
+        if (!$status_cmd) { $result->{status} = { executed => 0 }; return 1 }
 
-    my $status_cmd = expand_cmd($ci, $inst, $ci->{status_cmd} // '');
-    if (!$status_cmd) {
-        $result->{status} = { executed => 0 };
-        return $p;
-    }
-
-    $p = $p->then(sub {
-        return run_cmd_subprocess_p($status_cmd)->then(sub {
+        run_cmd_subprocess_p($status_cmd)->then(sub {
             my ($r) = @_;
-            my $status_rc  = $r->{rc} // 255;
-            my $status_out = $r->{output} // '';
-            $status_out =~ s/\r//g;
-            $status_out =~ s/^\s+|\s+$//g;
+            my $rc  = $r->{rc} // 255;
+            my $out = $r->{output} // '';
+            $out =~ s/\r//g; $out =~ s/^\s+|\s+$//g;
 
-            $result->{status} = {
-                executed => 1,
-                command  => $status_cmd,
-                rc       => $status_rc,
-                output   => $status_out,
-            };
-
-            my $st = parse_service_status($status_out, $status_rc);
+            $result->{status} = { executed=>1, command=>$status_cmd, rc=>$rc, output=>$out };
+            my $st = parse_service_status($out, $rc);
             $result->{status}{result} = $st;
 
-            # Wichtig: Status-Checks sollen NIE die ganze Operation killen.
-            # Wir liefern Warnungen, aber kein rejected Promise.
             return 1 if $st eq 'running';
+            if ($st eq 'unknown-ok') { $result->{status}{warning} = 'Status nicht eindeutig (toleriert)'; return 1 }
+            if ($rc == 0)            { $result->{status}{warning} = 'Status meldet nicht running, aber rc=0 (toleriert)'; return 1 }
 
-            if ($st eq 'unknown-ok') {
-                $result->{status}{warning} = 'Status nicht eindeutig (toleriert)';
-                return 1;
-            }
-
-            if (defined $status_rc && $status_rc == 0) {
-                $result->{status}{warning} = 'Status meldet nicht running, aber rc=0 (toleriert)';
-                return 1;
-            }
-
-            $result->{status}{warning} = "Status meldet '$st' (rc=$status_rc)";
-            return 1;
+            $result->{status}{warning} = "Status meldet '$st' (rc=$rc)";
+            1;
         });
-	})->catch(sub {
+    })->catch(sub {
         my ($err) = @_;
-        # Wir loggen den Fehler, damit er nicht verschwindet
-        $logger->warn("Status-Check fehlgeschlagen: $err"); 
-        
-        $result->{status} = { 
-            executed => 1, 
-            result   => 'fail', 
-            error    => "$err" 
-        };
-        # Das hier verhindert den "Unhandled rejected promise" Fehler:
-        return Mojo::Promise->resolve(1); 
+        $logger->warn("Status-Check fehlgeschlagen: $err");
+        $result->{status} = { executed => 1, result => 'fail', error => "$err" };
+        Mojo::Promise->resolve(1);
     });
-
-    return $p;
 }
 
-# -------------------- Routen --------------------
-get '/' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        $c->render(json => { info => 'Postfix Agent', version => $VERSION });
-    });
-};
+sub apply_map_change_p {
+    my (%a) = @_;
+    my ($ci, $inst, $map, $result, $writecb) = @a{qw/ci inst map result writecb/};
 
-get '/instances' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        $c->render(json => { instances => [sort keys %{ $config->{instances} }]} );
-    });
-};
+    with_map_lock($ci, $map, 1, sub {
+        $writecb->();
 
-get '/instances/:inst/maps' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
+        my $p = Mojo::Promise->resolve(1);
+        my $pm_cmd = postmap_cmd($ci, $map, $inst);
 
-        my %seen;
-        my $globs = $ci->{globs} // {};
-        my $want_all = ($c->param('all') // '') eq '1';
+        $result->{postmap} //= { executed => 0 };
+        $p = $p->then(sub { run_cmd_into_result_p(cmd=>$pm_cmd, slot=>$result->{postmap}, mode=>'strict', label=>'postmap') });
 
-        if ($want_all || !%$globs) {
-            if (opendir(my $dh, $ci->{map_dir})) {
-                while (my $e = readdir($dh)) {
-                    next if $e =~ /^\./;
-                    next if _deny_forbidden_map($e);
-                    my $p = "$ci->{map_dir}/$e";
-                    $seen{$e} = 1 if -f $p;
-                }
-                closedir $dh;
-            }
+        if ($ci->{reload_on_change}) {
+            my $reload_cmd = expand_cmd($ci, $inst, $ci->{reload_cmd} // '');
+            $result->{reload} //= { executed => 0 };
+            $p = $p->then(sub { run_cmd_into_result_p(cmd=>$reload_cmd, slot=>$result->{reload}, mode=>'warn', label=>'reload') })
+                   ->then(sub { _status_verify_p($ci, $inst, $result) });
         } else {
-            for my $glob (keys %$globs) {
-                for my $f (glob "$ci->{map_dir}/$glob") {
-                    my $bn = path($f)->basename;
-                    next if _deny_forbidden_map($bn);
-                    $seen{$bn} = 1 if -f $f;
-                }
-            }
+            $result->{reload} //= { executed => 0 };
+            $result->{status} //= { executed => 0 };
         }
 
-        $c->render(json => { ok => 1, maps => [sort keys %seen] });
-    });
-};
+        $p;
+    }, $inst);
+}
 
-get '/instances/:inst/map/*map' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
+sub render_lock_error_or_500 {
+    my ($c, $err, $result_opt) = @_;
+    $err = "$err";
+    return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' }) if $err =~ /Lock-Timeout/;
 
-        my ($map, $err) = sanitize_map_name($c->stash('map'));
-        return $c->render(status=>400, json=>{ ok=>0, error=>$err }) if $err;
-        return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
-            if _deny_forbidden_map($map);
+    if ($result_opt && ref($result_opt) eq 'HASH') {
+        $result_opt->{ok} = 0;
+        $result_opt->{error} = $err;
+        return $c->render(status => 500, json => $result_opt);
+    }
+    $c->render(status => 500, json => { ok => 0, error => $err });
+}
 
-        my $path = "$ci->{map_dir}/$map";
-        unless (-r $path) { return $c->render(status => 404, json => { ok => 0, error => 'Not found' }); }
+# -------------------- Route handlers --------------------
+sub h_root      { my ($c)=@_; $c->render(json => { info => 'Postfix Agent', version => $VERSION }) }
+sub h_instances { my ($c)=@_; $c->render(json => { instances => [ sort keys %{ $config->{instances} } ] }) }
 
-        my $text = read_text($path);
-        $c->res->headers->content_type('text/plain; charset=UTF-8');
-        $c->render(data => $text);
-    });
-};
+sub h_list_maps {
+    my ($c, $inst, $ci) = @_;
+    my %seen;
+    my $globs = $ci->{globs} // {};
+    my $want_all = ($c->param('all') // '') eq '1';
 
-get '/instances/:inst/backup/*map' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
-
-        my ($base, $err) = sanitize_map_name($c->stash('map'));
-        return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
-        return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
-            if _deny_forbidden_map($base);
-
-        my $backup_dir = effective_backup_dir($ci, $inst)
-            or return $c->render(status => 404, json => { ok => 0, error => 'No backup_dir' });
-
-        my @files = glob("$backup_dir/$base.bak.*");
-        @files = sort { (stat($b))[9] <=> (stat($a))[9] } @files;
-        @files = map { s{^$backup_dir/}{}r } @files;
-
-        $c->render(json => { ok => 1, backups => \@files });
-    });
-};
-
-get '/instances/:inst/backupfile/*backup' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
-
-        my ($backup_file, $err) = sanitize_map_name($c->stash('backup') // '');
-        return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
-
-        my $backup_dir  = effective_backup_dir($ci, $inst);
-        unless ($backup_dir && -d $backup_dir) { return $c->render(status => 500, json => { ok => 0, error => 'No backup dir' }); }
-
-        my $fullpath = "$backup_dir/$backup_file";
-        unless ($backup_file && -f $fullpath && -r $fullpath) { return $c->render(status => 404, json => { ok => 0, error => 'Backup file not found' }); }
-
-        my $mode = $c->param('mode') // 'text';
-        if ($mode eq 'download') {
-            my $bytes = read_raw($fullpath);
-            $c->res->headers->content_disposition(qq{attachment; filename="$backup_file"});
-            $c->res->headers->content_type('application/octet-stream');
-            return $c->render(data => $bytes);
-        } elsif ($mode eq 'json') {
-            my $content = read_text($fullpath);
-            $content =~ s/\r\n/\n/g;
-            return $c->render(json => { ok => 1, name => $backup_file, size => length($content), content => $content });
-        } else {
-            my $content = read_text($fullpath);
-            $c->res->headers->content_type('text/plain; charset=UTF-8');
-            return $c->render(data => $content);
+    if ($want_all || !%$globs) {
+        if (opendir(my $dh, $ci->{map_dir})) {
+            while (my $e = readdir($dh)) {
+                next if $e =~ /^\./;
+                next if deny_forbidden_map($e);
+                my $p = "$ci->{map_dir}/$e";
+                $seen{$e} = 1 if -f $p;
+            }
+            closedir $dh;
         }
-    });
-};
+    } else {
+        for my $glob (keys %$globs) {
+            for my $f (glob "$ci->{map_dir}/$glob") {
+                my $bn = path($f)->basename;
+                next if deny_forbidden_map($bn);
+                $seen{$bn} = 1 if -f $f;
+            }
+        }
+    }
 
-post '/instances/:inst/map/*map' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
+    $c->render(json => { ok => 1, maps => [ sort keys %seen ] });
+}
 
-        my %result = (
-            ok => 1, error => '', changed => 0,
-            backup => 'skipped', write => 'skipped',
-            postmap => { executed => 0 },
-            reload  => { executed => 0 },
-            status  => { executed => 0 },
+sub h_get_map {
+    my ($c, $inst, $ci) = @_;
+    my ($map, $err) = sanitize_map_name($c->stash('map'));
+    return $c->render(status=>400, json=>{ ok=>0, error=>$err }) if $err;
+    return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' }) if deny_forbidden_map($map);
+
+    my $p = "$ci->{map_dir}/$map";
+    return $c->render(status => 404, json => { ok => 0, error => 'Not found' }) unless -r $p;
+
+    $c->res->headers->content_type('text/plain; charset=UTF-8');
+    $c->render(data => read_text($p));
+}
+
+sub h_list_backups {
+    my ($c, $inst, $ci) = @_;
+    my ($base, $err) = sanitize_map_name($c->stash('map'));
+    return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
+    return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' }) if deny_forbidden_map($base);
+
+    my $backup_dir = effective_backup_dir($ci, $inst)
+      or return $c->render(status => 404, json => { ok => 0, error => 'No backup_dir' });
+
+    my @files = glob("$backup_dir/$base.bak.*");
+    @files = sort { (stat($b))[9] <=> (stat($a))[9] } @files;
+    @files = map { s{^\Q$backup_dir\E/}{}r } @files;
+
+    $c->render(json => { ok => 1, backups => \@files });
+}
+
+sub h_get_backupfile {
+    my ($c, $inst, $ci) = @_;
+    my ($backup_file, $err) = sanitize_map_name($c->stash('backup') // '');
+    return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
+
+    my $backup_dir = effective_backup_dir($ci, $inst);
+    return $c->render(status => 500, json => { ok => 0, error => 'No backup dir' }) unless $backup_dir && -d $backup_dir;
+
+    my $fullpath = "$backup_dir/$backup_file";
+    return $c->render(status => 404, json => { ok => 0, error => 'Backup file not found' }) unless -f $fullpath && -r $fullpath;
+
+    my $mode = $c->param('mode') // 'text';
+    if ($mode eq 'download') {
+        my $bytes = read_raw($fullpath);
+        $c->res->headers->content_disposition(qq{attachment; filename="$backup_file"});
+        $c->res->headers->content_type('application/octet-stream');
+        return $c->render(data => $bytes);
+    }
+    if ($mode eq 'json') {
+        my $content = read_text($fullpath);
+        $content =~ s/\r\n/\n/g;
+        return $c->render(json => { ok => 1, name => $backup_file, size => length($content), content => $content });
+    }
+
+    $c->res->headers->content_type('text/plain; charset=UTF-8');
+    $c->render(data => read_text($fullpath));
+}
+
+sub h_save_map {
+    my ($c, $inst, $ci) = @_;
+
+    my %result = (
+        ok => 1, error => '', changed => 0,
+        backup => 'skipped', write => 'skipped',
+        postmap => { executed => 0 },
+        reload  => { executed => 0 },
+        status  => { executed => 0 },
+    );
+
+    my ($map, $san_err) = sanitize_map_name($c->stash('map'));
+    if ($san_err) { $result{ok}=0; $result{error}=$san_err; return $c->render(status=>400, json=>\%result) }
+    return $c->render(status => 400, json => { ok => 0, error => 'forbidden map name' }) if deny_forbidden_map($map);
+
+    my $path = "$ci->{map_dir}/$map";
+
+    my $new_content;
+    my $ct = $c->req->headers->content_type // '';
+    my $json;
+
+    if ($ct =~ m{\bapplication/json\b}i) {
+        $json = eval { $c->req->json };
+        $logger->warn("JSON parse failed: $@") if $@;
+    }
+
+    if (defined $json) {
+        if (ref($json) eq 'HASH' && exists $json->{content}) { $new_content = $json->{content} }
+        elsif (!ref($json))                                   { $new_content = "$json" }
+        else                                                  { $new_content = to_json($json, { canonical => 1 }) }
+    }
+
+    $new_content //= $c->param('content');
+    $new_content //= decode('UTF-8', $c->req->body // '');
+    $new_content =~ s/\r\n/\n/g if defined $new_content;
+
+    my $dir = path($path)->dirname->to_string;
+    if (!-d $dir) {
+        my $e = ensure_dir(dir=>$dir, user=>$global->{serviceUser}, group=>$global->{serviceGroup}, mode=>$global->{dirs}{service_mode});
+        $logger->warn($e) if $e;
+    }
+
+    unless (-w $dir) {
+        my @st = stat($dir);
+        return $c->render(status => 403, json => {
+            ok => 0, error => 'Directory not writable',
+            details => {
+                dir  => $dir,
+                mode => sprintf('%04o', ($st[2] // 0) & 07777),
+                uid  => $st[4], gid => $st[5],
+                euid => $<, egid => $(,
+                inst => $inst
+            }
+        });
+    }
+
+    if (-e $path && !-w $path) { $result{ok}=0; $result{error}='Not found or not writable'; return $c->render(status=>403, json=>\%result) }
+
+    my ($old, $read_error) = ('', 0);
+    try { $old = (-e $path) ? read_text($path) : '' }
+    catch { $read_error = $_; $logger->error("Fehler beim Lesen von $path: $_") };
+
+    if ($read_error) { $result{ok}=0; $result{error}="Fehler beim Lesen: $read_error"; return $c->render(status=>500, json=>\%result) }
+
+    $new_content = "#\n" if (!-e $path) && !(defined($new_content) && $new_content ne '');
+    if ($new_content eq $old) { $result{write}='skipped'; $result{backup}='skipped'; return $c->render(json=>\%result) }
+
+    $result{changed} = 1;
+
+    my $p = eval {
+        apply_map_change_p(
+            ci=>$ci, inst=>$inst, map=>$map, result=>\%result,
+            writecb => sub {
+                my $bdir = effective_backup_dir($ci, $inst);
+                if (-e $path) { backup_file($path, $bdir, $ci->{max_backups} // 5); $result{backup}='ok' }
+                else          { $result{backup}='not_existing' }
+
+                atomic_write($path, $new_content, effective_service_user(), effective_service_group(), effective_file_mode());
+                $result{write} = 'ok';
+            }
         );
+    };
+    return render_lock_error_or_500($c, $@, \%result) unless $p;
 
-        my ($map, $san_err) = sanitize_map_name($c->stash('map'));
-        if ($san_err) {
-            $result{ok} = 0; $result{error} = $san_err;
-            return $c->render(json => \%result, status => 400);
-        }
-        return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
-            if _deny_forbidden_map($map);
+    $p->then(sub { $c->render(json => \%result) })
+      ->catch(sub { render_lock_error_or_500($c, $_[0], \%result) });
+}
 
-        my $path = "$ci->{map_dir}/$map";
+sub h_restore_backup {
+    my ($c, $inst, $ci) = @_;
 
-        my $new_content;
-        my $ct = $c->req->headers->content_type // '';
-        my $json;
-        if ($ct =~ m{\bapplication/json\b}i) {
-            $json = eval { $c->req->json };
-            $logger->warn("JSON parse failed: $@") if $@;
-        }
+    my ($backupfile, $err) = sanitize_map_name($c->stash('backupfile') // '');
+    return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
 
-        if (defined $json) {
-            if (ref($json) eq 'HASH' && exists $json->{content}) { $new_content = $json->{content}; }
-            elsif (!ref($json))                                   { $new_content = "$json"; }
-            else                                                 { $new_content = encode_json(_json_canonicalize($json)); }
-        }
+    my $backup_dir = effective_backup_dir($ci, $inst);
+    my $map_dir    = $ci->{map_dir};
+    return $c->render(status => 500, json => { ok => 0, error => 'No backup dir' }) unless $backup_dir && -d $backup_dir;
+    return $c->render(status => 500, json => { ok => 0, error => 'No map dir' })    unless $map_dir    && -d $map_dir;
 
-        $new_content //= $c->param('content');
-        $new_content //= decode('UTF-8', $c->req->body // '');
-        $new_content =~ s/\r\n/\n/g if defined $new_content;
+    my $src = "$backup_dir/$backupfile";
+    return $c->render(status => 404, json => { ok => 0, error => 'Backup file not found' }) unless -f $src;
 
-        my $dir = path($path)->dirname->to_string;
-        unless (-d $dir) {
-            eval { path($dir)->make_path };
-            if ($@) {
-                return $c->render(status => 500, json => { ok => 0, error => 'map_dir create failed', details => { dir => $dir, msg => "$@", inst => $inst } });
+    (my $map = $backupfile) =~ s/\.bak.*$//;
+    return $c->render(status => 400, json => { ok => 0, error => 'forbidden map name' }) if deny_forbidden_map($map);
+
+    my $dst = "$map_dir/$map";
+    my %result = ( ok => 1, restored => $backupfile, target => $dst );
+
+    my $p = eval {
+        apply_map_change_p(
+            ci=>$ci, inst=>$inst, map=>$map, result=>\%result,
+            writecb => sub {
+                atomic_write($dst, path($src)->slurp, $global->{serviceUser}, $global->{serviceGroup}, $global->{fileMode_service});
             }
-            my $err = set_dir_ownership_and_mode($dir, $global->{serviceUser}, $global->{serviceGroup}, $global->{dirs}{service_mode});
-            $logger->warn("set_dir_ownership_and_mode($dir): $err") if $err;
-        }
-
-        unless (-w $dir) {
-            my @st = stat($dir);
-            return $c->render(status => 403, json => {
-                ok => 0, error => 'Directory not writable',
-                details => {
-                    dir  => $dir,
-                    mode => sprintf('%04o', ($st[2] // 0) & 07777),
-                    uid  => $st[4], gid => $st[5],
-                    euid => $<, egid => $(,
-                    inst => $inst
-                }
-            });
-        }
-
-        if (-e $path && !-w $path) {
-            $result{ok} = 0; $result{error} = 'Not found or not writable';
-            return $c->render(json => \%result, status => 403);
-        }
-
-        my $old_content = '';
-        my $read_error = 0;
-        try {
-            $old_content = (-e $path) ? read_text($path) : '';
-        } catch {
-            $read_error = $_; $logger->error("Fehler beim Lesen von $path: $_");
-        };
-        if ($read_error) {
-            $result{ok} = 0; $result{error} = "Fehler beim Lesen: $read_error";
-            return $c->render(json => \%result, status => 500);
-        }
-
-        if (!-e $path) {
-            $new_content = "#\n" unless defined($new_content) && $new_content ne '';
-        }
-
-        if ($new_content ne $old_content) {
-            $result{changed} = 1;
-
-            my $lock_ret;
-            my $ok_lock = eval {
-                $lock_ret = with_map_lock($ci, $map, 1, sub {
-                    my $bdir = effective_backup_dir($ci, $inst);
-
-                    if (-e $path) {
-                        backup_file($path, $bdir, $ci->{max_backups} // 5, $ci);
-                        $result{backup} = 'ok';
-                    } else {
-                        $result{backup} = 'not_existing';
-                    }
-
-                    atomic_write(
-                        $path, $new_content,
-                        effective_service_user(),
-                        effective_service_group(),
-                        effective_file_mode()
-                    );
-                    $result{write} = 'ok';
-
-                    my $p = Mojo::Promise->resolve;
-
-                    if (my $pm_cmd = postmap_cmd($ci, $map, $inst)) {
-                        $p = $p->then(sub {
-                            return run_cmd_subprocess_p($pm_cmd)->then(sub {
-                                my ($r) = @_;
-                                my $pm_rc  = $r->{rc} // 255;
-                                my $pm_out = $r->{output} // '';
-                                $result{postmap} = {
-                                    executed => 1, command => $pm_cmd,
-                                    rc => $pm_rc, output => $pm_out,
-                                    result => ($pm_rc == 0) ? 'ok' : 'fail',
-                                };
-                                die "postmap rc=$pm_rc: $pm_out" if $pm_rc != 0;
-                                return 1;
-                            });
-                        })->catch(sub {
-                            my ($err) = @_;
-                            $result{postmap} = { executed => 1, result => 'fail', error => "$err" };
-                            return 1;
-                        });
-                    }
-
-                    if ($ci->{reload_on_change}) {
-                        my $reload_cmd = expand_cmd($ci, $inst, $ci->{reload_cmd} // '');
-                        if ($reload_cmd) {
-                            $p = $p->then(sub {
-                                return run_cmd_subprocess_p($reload_cmd)->then(sub {
-                                    my ($r) = @_;
-                                    my $reload_rc  = $r->{rc} // 255;
-                                    my $reload_out = $r->{output} // '';
-                                    $result{reload} = {
-                                        executed => 1, command => $reload_cmd,
-                                        rc => $reload_rc, output => $reload_out,
-                                        result => 'ok',
-                                    };
-                                    if ($reload_rc != 0) {
-                                        $result{reload}{result}  = 'warn';
-                                        $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
-                                    }
-                                    return 1;
-                                });
-                            })->catch(sub {
-                                my ($err) = @_;
-                                $result{reload} = { executed => 1, result => 'fail', error => "$err" };
-                                return 1;
-                            });
-                        } else {
-                            $result{reload} = { executed => 0 };
-                        }
-
-                        $p = $p->then(sub { return _status_verify_p($ci, $inst, \%result); });
-                    }
-
-                    return $p;
-                }, $inst);
-                1;
-            };
-
-            if (!$ok_lock) {
-                my $lock_err = $@;
-                if ($lock_err =~ /Lock-Timeout/) {
-                    return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
-                }
-                $result{ok} = 0; $result{error} = "$lock_err";
-                return $c->render(json => \%result, status => 500);
-            }
-
-            if ($lock_ret && ref($lock_ret) && eval { $lock_ret->isa('Mojo::Promise') }) {
-                return $lock_ret->then(sub {
-                    return $c->render(json => \%result);
-                })->catch(sub {
-                    my ($e) = @_;
-                    $e = "$e";
-                    if ($e =~ /Lock-Timeout/) {
-                        return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
-                    }
-                    $result{ok} = 0; $result{error} = $e;
-                    return $c->render(json => \%result, status => 500);
-                });
-            }
-
-            return $c->render(json => \%result);
-        }
-
-        $result{write}  = 'skipped';
-        $result{backup} = 'skipped';
-        return $c->render(json => \%result);
-    });
-};
-
-post '/instances/:inst/restore/*backupfile' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
-
-        my ($backupfile, $err) = sanitize_map_name($c->stash('backupfile') // '');
-        return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
-
-        my $backup_dir = effective_backup_dir($ci, $inst);
-        my $map_dir    = $ci->{map_dir};
-        return $c->render(status => 500, json => { ok => 0, error => 'No backup dir' }) unless $backup_dir && -d $backup_dir;
-        return $c->render(status => 500, json => { ok => 0, error => 'No map dir' })    unless $map_dir    && -d $map_dir;
-
-        my $src = "$backup_dir/$backupfile";
-        return $c->render(status => 404, json => { ok => 0, error => 'Backup file not found' }) unless -f $src;
-
-        (my $map = $backupfile) =~ s/\.bak.*$//;
-        return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
-            if _deny_forbidden_map($map);
-
-        my $dst = "$map_dir/$map";
-        my %result = ( ok => 1, restored => $backupfile, target => $dst );
-
-        my $lock_ret;
-        my $ok_lock = eval {
-            $lock_ret = with_map_lock($ci, $map, 1, sub {
-                my $data = path($src)->slurp;
-
-                atomic_write(
-                    $dst,
-                    $data,
-                    $global->{serviceUser},
-                    $global->{serviceGroup},
-                    $global->{fileMode_service}
-                );
-
-                my $p = Mojo::Promise->resolve;
-
-                if (my $pm_cmd = postmap_cmd($ci, $map, $inst)) {
-                    $p = $p->then(sub {
-                        return run_cmd_subprocess_p($pm_cmd)->then(sub {
-                            my ($r) = @_;
-                            my $pm_rc  = $r->{rc} // 255;
-                            my $pm_out = $r->{output} // '';
-                            $result{postmap} = {
-                                executed => 1, command => $pm_cmd,
-                                rc => $pm_rc, output => $pm_out,
-                                result => ($pm_rc == 0) ? 'ok' : 'fail',
-                            };
-                            die "postmap rc=$pm_rc: $pm_out" if $pm_rc != 0;
-                            return 1;
-                        });
-                    })->catch(sub {
-                        my ($err) = @_;
-                        $result{postmap} = { executed => 1, result => 'fail', error => "$err" };
-                        return 1;
-                    });
-                } else {
-                    $result{postmap} = { executed => 0 };
-                }
-
-                if ($ci->{reload_on_change}) {
-                    my $reload_cmd = expand_cmd($ci, $inst, $ci->{reload_cmd} // '');
-                    if ($reload_cmd) {
-                        $p = $p->then(sub {
-                            return run_cmd_subprocess_p($reload_cmd)->then(sub {
-                                my ($r) = @_;
-                                my $reload_rc  = $r->{rc} // 255;
-                                my $reload_out = $r->{output} // '';
-                                $result{reload} = {
-                                    executed => 1, command => $reload_cmd,
-                                    rc => $reload_rc, output => $reload_out,
-                                    result => 'ok',
-                                };
-                                if ($reload_rc != 0) {
-                                    $result{reload}{result}  = 'warn';
-                                    $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
-                                }
-                                return 1;
-                            });
-                        })->catch(sub {
-                            my ($err) = @_;
-                            $result{reload} = { executed => 1, result => 'fail', error => "$err" };
-                            return 1;
-                        });
-                    } else {
-                        $result{reload} = { executed => 0 };
-                    }
-
-                    $p = $p->then(sub { return _status_verify_p($ci, $inst, \%result); });
-                }
-
-                return $p;
-            }, $inst);
-            1;
-        };
-
-        if (!$ok_lock) {
-            my $lock_err = $@;
-            if ($lock_err =~ /Lock-Timeout/) {
-                return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
-            }
-            $result{ok} = 0; $result{error} = "$lock_err";
-            return $c->render(json => \%result, status => 500);
-        }
-
-        if ($lock_ret && ref($lock_ret) && eval { $lock_ret->isa('Mojo::Promise') }) {
-            return $lock_ret->then(sub {
-                return $c->render(json => \%result);
-            })->catch(sub {
-                my ($e) = @_;
-                $e = "$e";
-                if ($e =~ /Lock-Timeout/) {
-                    return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
-                }
-                $result{ok} = 0; $result{error} = $e;
-                return $c->render(json => \%result, status => 500);
-            });
-        }
-
-        return $c->render(json => \%result);
-    });
-};
-
-# Map deregistrieren (nur configs.json) + Hinweise
-post '/instances/:inst/delmap/*map' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
-        return unless $ci;
-
-        my ($map, $err) = sanitize_map_name($c->stash('map'));
-        return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
-        return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
-            if _deny_forbidden_map($map);
-
-        my $ci2 = $config->{instances}{$inst}
-            or return $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' });
-
-        my $cfg_label = 'configs.json';
-        my $cfg_file  = $instances_cfg_file;
-        my $cfg_write_err;
-        my $removed_from_globs = 0;
-        my $instances_data = {};
-        my $has_wrapper    = 0;
-        my $node;
-
-        try {
-            $instances_data = -e $instances_cfg_file
-                ? decode_json( read_text($instances_cfg_file) )
-                : {};
-            $has_wrapper = ref($instances_data->{instances}) eq 'HASH' ? 1 : 0;
-
-            if ($has_wrapper) {
-                $node = $instances_data->{instances}{$inst};
-            } else {
-                if (ref($instances_data->{$inst}) eq 'HASH') {
-                    $node = $instances_data->{$inst};
-                } elsif ($inst eq 'default' && _looks_like_instance_node($instances_data)) {
-                    $node = $instances_data;
-                }
-            }
-            unless ($node && ref($node) eq 'HASH') {
-                die "Unknown instance '$inst'";
-            }
-
-            if (ref($node->{globs}) eq 'HASH' && exists $node->{globs}{$map}) {
-                $logger->info("Entferne Map '$map' aus globs der Instanz '$inst'");
-                delete $node->{globs}{$map};
-                _write_cfg_hash_atomic($instances_data);
-                $removed_from_globs = 1;
-                _rebuild_cfgmap_from($instances_data);
-            }
-        } catch {
-            my $error = $_;
-            $cfg_write_err = "Fehler beim Aktualisieren der Konfiguration fuer Instanz '$inst' (Map: '$map'): $error";
-            $logger->error($cfg_write_err);
-        };
-
-        if ($cfg_write_err) {
-            return $c->render(status => 500, json => { ok => 0, error => "Konfiguration konnte nicht aktualisiert werden: $cfg_write_err" });
-        }
-
-        my @matched_patterns;
-        eval {
-            my $globs_h = (ref($node->{globs}) eq 'HASH') ? $node->{globs} : {};
-            unless ($removed_from_globs) {
-                for my $glob (keys %$globs_h) {
-                    next if $glob eq $map;
-                    my $re = $glob; $re =~ s/\./\\./g; $re =~ s/\*/.*/g;
-                    push @matched_patterns, $glob if $map =~ /^$re$/;
-                }
-            }
-            1;
-        } or do { $logger->warn("Pattern-Check fehlgeschlagen: $@"); };
-
-        my ($action, $msg);
-        if ($removed_from_globs) {
-            $action = 'removed';
-            $msg    = "Eintrag in $cfg_label, globs der Instanz '$inst' wurde fuer '$map' entfernt.";
-        } elsif (@matched_patterns) {
-            $action = 'pattern_only';
-            $msg    = "Kein exakter Eintrag fuer '$map' in $cfg_label, globs der Instanz '$inst'. "
-                    . "Die Datei wird jedoch durch folgende Muster abgedeckt: "
-                    . join(', ', @matched_patterns) . ". Es wurde nichts geaendert.";
-        } else {
-            $action = 'not_registered';
-            $msg    = "Fuer '$map' existiert kein Eintrag in $cfg_label, globs der Instanz '$inst'. "
-                    . "Es wurde nichts geaendert.";
-        }
-
-        $msg .= " Diese API loescht keine Dateien. Bitte bereinige Verweise in main.cf/master.cf bei Bedarf.";
-
-        my %out = (
-            ok                   => 1,
-            instance             => $inst,
-            map                  => $map,
-            action               => $action,
-            matched_patterns     => \@matched_patterns,
-            changed_configs_json => $removed_from_globs ? true : false,
-            action_required      => $msg,
-            note                 => "Kein Reload und keine Datei-Loeschung durchgefuehrt (Policy).",
-            configs_file         => $cfg_file,
         );
+    };
+    return render_lock_error_or_500($c, $@, \%result) unless $p;
 
-        $c->res->headers->content_type('application/json; charset=UTF-8');
-        return $c->render(json => \%out);
+    $p->then(sub { $c->render(json => \%result) })
+      ->catch(sub { render_lock_error_or_500($c, $_[0], \%result) });
+}
+
+sub h_delmap {
+    my ($c, $inst, $ci) = @_;
+
+    my ($map, $err) = sanitize_map_name($c->stash('map'));
+    return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
+    return $c->render(status => 400, json => { ok => 0, error => 'forbidden map name' }) if deny_forbidden_map($map);
+
+    my $cfg = eval { cfg_load() };
+    return $c->render(status => 500, json => { ok => 0, error => "configs.json lesen: $@" }) if $@;
+
+    my $node = cfg_node($cfg, $inst);
+    my $gl   = (ref($node->{globs}) eq 'HASH') ? $node->{globs} : {};
+    $node->{globs} = $gl;
+
+    my $removed = 0;
+    if (exists $gl->{$map}) { delete $gl->{$map}; $removed = 1 }
+
+    eval { cfg_save($cfg); 1 } or return $c->render(status => 500, json => { ok => 0, error => "configs.json schreiben: $@" });
+    eval { cfg_rebuild_instances($cfg); 1 };
+
+    my @matched_patterns;
+    if (!$removed) {
+        _ensure_glob_cache($ci);
+        my $cache = $ci->{_glob_re_cache} // {};
+        my $order = $ci->{_glob_re_order} // [];
+        for my $glob (@$order) {
+            my $re = $cache->{$glob} or next;
+            push @matched_patterns, $glob if $map =~ $re;
+        }
+    }
+
+    my ($action, $msg);
+    if ($removed) {
+        $action = 'removed';
+        $msg = "Eintrag in configs.json globs der Instanz '$inst' wurde fuer '$map' entfernt.";
+    } elsif (@matched_patterns) {
+        $action = 'pattern_only';
+        $msg = "Kein exakter Eintrag fuer '$map' in configs.json globs der Instanz '$inst'. Datei ist aber durch Muster abgedeckt: ".join(', ', @matched_patterns).". Es wurde nichts geaendert.";
+    } else {
+        $action = 'not_registered';
+        $msg = "Fuer '$map' existiert kein Eintrag in configs.json globs der Instanz '$inst'. Es wurde nichts geaendert.";
+    }
+    $msg .= " Diese API loescht keine Dateien. Bitte bereinige Verweise in main.cf/master.cf bei Bedarf.";
+
+    $c->render(json => {
+        ok                   => 1,
+        instance             => $inst,
+        map                  => $map,
+        action               => $action,
+        matched_patterns     => \@matched_patterns,
+        changed_configs_json => $removed ? true : false,
+        action_required      => $msg,
+        note                 => "Kein Reload und keine Datei-Loeschung durchgefuehrt (Policy).",
+        configs_file         => $instances_cfg_file,
     });
-};
+}
 
-get '/instances/:inst/globs' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my $inst = resolve_inst_name($c->stash('inst'));
-        return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
+sub h_globs_get {
+    my ($c, $inst) = @_;
+    my $cfg = eval { cfg_load() };
+    return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
+    my $node = cfg_node($cfg, $inst);
+    my $gl   = (ref($node->{globs}) eq 'HASH') ? $node->{globs} : {};
+    $c->render(json => { ok=>1, instance=>$inst, globs=>$gl });
+}
 
-        my $cfg  = eval { _read_cfg_hash() };
-        return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
+sub _collect_glob_items_from_req {
+    my ($c) = @_;
+    my $j = eval { $c->req->json };
+    $j = {} if $@ || !defined $j;
 
-        my $node = _inst_node_rw($cfg, $inst);
-        my $gl   = (ref($node->{globs}) eq 'HASH') ? $node->{globs} : {};
-
-        $c->render(json => { ok=>1, instance=>$inst, globs=>$gl });
-    });
-};
-
-post '/instances/:inst/globs' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my $inst = resolve_inst_name($c->stash('inst'));
-        return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
-
-        my $j = eval { $c->req->json }; $j = {} if $@ || !defined $j;
-        my @items;
-
-        if (ref($j) eq 'HASH' && %$j) {
-            @items = ref($j->{items}) eq 'ARRAY' ? @{$j->{items}} : ($j);
-        } else {
-            if (defined(my $items_param = $c->param('items'))) {
-                my $arr = eval { decode_json($items_param) } || [];
-                @items = @$arr if ref($arr) eq 'ARRAY';
-            }
-            if (!@items) {
-                my $map  = $c->param('map')  // '';
-                my $type = $c->param('type') // '';
-                push @items, { map => $map, type => $type };
-            }
+    my @items;
+    if (ref($j) eq 'HASH' && %$j) {
+        @items = ref($j->{items}) eq 'ARRAY' ? @{$j->{items}} : ($j);
+    } else {
+        if (defined(my $items_param = $c->param('items'))) {
+            my $arr = eval { decode_json($items_param) } || [];
+            @items = @$arr if ref($arr) eq 'ARRAY';
         }
+        push @items, { map => ($c->param('map') // ''), type => ($c->param('type') // '') } unless @items;
+    }
+    @items;
+}
 
-        unless (@items && ref($items[0]) eq 'HASH') {
-            return $c->render(status=>400, json=>{ ok=>0, error=>'Payload fehlt oder ungueltig' });
-        }
+sub h_globs_upsert {
+    my ($c, $inst) = @_;
 
-        my @changes;
-        my %seen;
-        for my $it (@items) {
-            my $map_raw  = $it->{map}  // '';
-            my $type_raw = $it->{type} // '';
-            return $c->render(status=>400, json=>{ok=>0,error=>'map fehlt'})  unless length $map_raw;
-            return $c->render(status=>400, json=>{ok=>0,error=>'type fehlt'}) unless length $type_raw;
+    my @items = _collect_glob_items_from_req($c);
+    return $c->render(status=>400, json=>{ ok=>0, error=>'Payload fehlt oder ungueltig' }) unless @items && ref($items[0]) eq 'HASH';
 
-            my ($map, $e_map) = sanitize_glob_key($map_raw);
-            return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger map-key: ".($e_map||'?')})
-                unless defined $map;
+    my (@changes, %seen);
+    for my $it (@items) {
+        my $map_raw  = $it->{map}  // '';
+        my $type_raw = $it->{type} // '';
+        return $c->render(status=>400, json=>{ok=>0,error=>'map fehlt'})  unless length $map_raw;
+        return $c->render(status=>400, json=>{ok=>0,error=>'type fehlt'}) unless length $type_raw;
 
-            my ($type_norm, $e_type) = sanitize_glob_val(lc $type_raw);
-            return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger type: ".($e_type||'?')})
-                unless defined $type_norm;
+        my ($map, $e_map) = sanitize_glob_key($map_raw);
+        return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger map-key: ".($e_map||'?')}) unless defined $map;
 
-            return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger type: $type_norm"})
-                unless $GLOB_TYPES{$type_norm};
+        my ($type_norm, $e_type) = sanitize_glob_val($type_raw);
+        return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger type: ".($e_type||'?')}) unless defined $type_norm;
+        return $c->render(status=>400, json=>{ok=>0,error=>"ungueltiger type: $type_norm"}) unless $GLOB_TYPES{$type_norm};
 
-            my $key = "$map\x1F$type_norm";
-            next if $seen{$key}++;
-            push @changes, [$map, $type_norm];
-        }
+        my $key = "$map\x1F$type_norm";
+        next if $seen{$key}++;
+        push @changes, [$map, $type_norm];
+    }
 
-        my $cfg  = eval { _read_cfg_hash() };
-        return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
-
-        my $node = _inst_node_rw($cfg, $inst);
-        $node->{globs} //= {};
-
-        my @applied;
-        for my $ch (@changes) {
-            my ($map,$type) = @$ch;
-            my $prev = $node->{globs}{$map};
-            $node->{globs}{$map} = $type;
-            push @applied, { map => $map, type => $type, action => (defined $prev ? 'updated' : 'created'), previous_type => $prev };
-        }
-
-        eval { _write_cfg_hash_atomic($cfg); 1 } or
-            return $c->render(status=>500, json=>{ok=>0,error=>"configs.json schreiben: $@"});
-        eval { _rebuild_cfgmap_from($cfg); 1 };
-
-        return $c->render(json => { ok=>1, instance=>$inst, upserted=>\@applied });
-    });
-};
-
-del '/instances/:inst/globs/:map' => sub {
-    my $c    = shift;
-    my $inst = resolve_inst_name($c->stash('inst'));
-    return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
-
-    my $map  = $c->stash('map');
-    my $cfg  = eval { _read_cfg_hash() };
+    my $cfg = eval { cfg_load() };
     return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
 
-    my $node = _inst_node_rw($cfg, $inst);
-    my $had  = (ref($node->{globs}) eq 'HASH') && exists $node->{globs}{$map};
+    my $node = cfg_node($cfg, $inst);
+    $node->{globs} //= {};
 
+    my @applied;
+    for my $ch (@changes) {
+        my ($map,$type) = @$ch;
+        my $prev = $node->{globs}{$map};
+        $node->{globs}{$map} = $type;
+        push @applied, { map=>$map, type=>$type, action => (defined $prev ? 'updated' : 'created'), previous_type => $prev };
+    }
+
+    eval { cfg_save($cfg); 1 } or return $c->render(status=>500, json=>{ok=>0,error=>"configs.json schreiben: $@"});
+    eval { cfg_rebuild_instances($cfg); 1 };
+
+    $c->render(json => { ok=>1, instance=>$inst, upserted=>\@applied });
+}
+
+sub h_globs_delete {
+    my ($c, $inst) = @_;
+    my $map = $c->stash('map');
+
+    my $cfg = eval { cfg_load() };
+    return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
+
+    my $node = cfg_node($cfg, $inst);
+    my $had  = (ref($node->{globs}) eq 'HASH') && exists $node->{globs}{$map};
     delete $node->{globs}{$map} if $had;
 
-    eval { _write_cfg_hash_atomic($cfg); 1 } or
-        return $c->render(status=>500, json=>{ok=>0,error=>"configs.json schreiben: $@"});
-    _rebuild_cfgmap_from($cfg);
+    eval { cfg_save($cfg); 1 } or return $c->render(status=>500, json=>{ok=>0,error=>"configs.json schreiben: $@"});
+    eval { cfg_rebuild_instances($cfg); 1 };
 
     $c->render(json => { ok=>1, instance=>$inst, map=>$map, removed=>($had?true:false) });
-};
+}
 
-get '/health' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        my @required_dirs = ($tmp_dir);
-        for my $name (keys %{ $config->{instances} }) {
-            my $ci = $config->{instances}{$name};
-            my $bdir = effective_backup_dir($ci, $name);
-            push @required_dirs, $bdir if $bdir;
-        }
-        my @miss = grep { $_ && !-d $_ } @required_dirs;
-        if (@miss) { $c->render(status => 500, json => { ok => 0, error => "Missing dirs: @miss" }); }
-        else       { $c->render(json => { ok => 1, status => "ok" }); }
-    });
-};
+sub h_health {
+    my ($c) = @_;
+    my @required_dirs = ($tmp_dir);
+    for my $name (keys %{ $config->{instances} }) {
+        my $ci = $config->{instances}{$name};
+        my $bdir = effective_backup_dir($ci, $name);
+        push @required_dirs, $bdir if $bdir;
+    }
+    my @miss = grep { $_ && !-d $_ } @required_dirs;
+    return $c->render(status => 500, json => { ok => 0, error => "Missing dirs: @miss" }) if @miss;
+    $c->render(json => { ok => 1, status => "ok" });
+}
 
-any '/*' => sub {
-    my $c = shift;
-    return run_promise($c, sub {
-        $c->render(status => 404, json => { ok => 0, error => 'Not found' });
+# -------------------- Ultra clean route wrappers --------------------
+my %V = (get => \&get, post => \&post, del => \&del, any => \&any);
+
+sub R {
+    my ($verb, $path, $handler) = @_;
+    my $reg = $V{$verb} or die "Unknown verb: $verb";
+    $reg->($path => sub {
+        my $c = shift;
+        run_promise($c, sub { $handler->($c) });
     });
-};
+}
+
+sub RI {
+    my ($verb, $path, $handler) = @_;
+    my $reg = $V{$verb} or die "Unknown verb: $verb";
+    $reg->($path => sub {
+        my $c = shift;
+        run_promise($c, sub {
+            my ($r, $inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+            return if $r;
+            $handler->($c, $inst, $ci);
+        });
+    });
+}
+
+sub RINSTONLY {
+    my ($verb, $path, $handler) = @_;
+    my $reg = $V{$verb} or die "Unknown verb: $verb";
+    $reg->($path => sub {
+        my $c = shift;
+        run_promise($c, sub {
+            my $inst = resolve_inst_name($c->stash('inst'));
+            return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
+            $handler->($c, $inst);
+        });
+    });
+}
+
+# -------------------- Routes (jetzt wirklich kompakt) --------------------
+R(get  => '/'                          => sub { h_root($_[0]) });
+R(get  => '/instances'                 => sub { h_instances($_[0]) });
+RI(get => '/instances/:inst/maps'      => sub { h_list_maps(@_) });
+RI(get => '/instances/:inst/map/*map'  => sub { h_get_map(@_) });
+RI(get => '/instances/:inst/backup/*map' => sub { h_list_backups(@_) });
+RI(get => '/instances/:inst/backupfile/*backup' => sub { h_get_backupfile(@_) });
+RI(post=> '/instances/:inst/map/*map'  => sub { h_save_map(@_) });
+RI(post=> '/instances/:inst/restore/*backupfile' => sub { h_restore_backup(@_) });
+RI(post=> '/instances/:inst/delmap/*map' => sub { h_delmap(@_) });
+
+RINSTONLY(get  => '/instances/:inst/globs'      => sub { h_globs_get(@_) });
+RINSTONLY(post => '/instances/:inst/globs'      => sub { h_globs_upsert(@_) });
+RINSTONLY(del  => '/instances/:inst/globs/:map' => sub { h_globs_delete(@_) });
+
+R(get  => '/health'                    => sub { h_health($_[0]) });
+R(any  => '/*'                         => sub { $_[0]->render(status => 404, json => { ok => 0, error => 'Not found' }) });
 
 # -------------------- Start Server --------------------
 my $url;
 if ($ssl_enable && $ssl_cert && $ssl_key) {
-    my $cert_q = url_escape($ssl_cert);
-    my $key_q  = url_escape($ssl_key);
-    $url = sprintf('https://%s?cert=%s&key=%s', $listen_addr, $cert_q, $key_q);
+    $url = sprintf('https://%s?cert=%s&key=%s', $listen_addr, url_escape($ssl_cert), url_escape($ssl_key));
 } else {
     $url = sprintf('http://%s', $listen_addr);
 }
-
-try {
-    $logger->info("Listening at $url (require_https=" . ($require_https?1:0) . ")");
-    set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup});
-} catch {
-    $logger->error("Logger-Fehler: $_");
-};
-
+$logger->info("Listening at $url (require_https=" . ($require_https?1:0) . ")");
 app->start('daemon', '-l', $url);
