@@ -33,13 +33,13 @@ Ein kleiner REST Dienst (Mojolicious Lite), der Postfix Map Dateien pro Instanz 
 
 ~~~text
 .
-├─ postfix-map-agent.pl
+├─ postfix-agent.pl
 ├─ global.json
 ├─ configs.json
 ├─ docs/
 │  └─ banner.png
 └─ systemd/
-   └─ postfix-map-agent.service
+   └─ postfix-agent.service
 ~~~
 
 ### Starten
