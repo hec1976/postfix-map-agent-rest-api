@@ -423,6 +423,12 @@ sub parse_service_status {
 
     my $txt = lc(($out // ''));
     $txt =~ s/\r//g;
+    $txt =~ s/^\s+|\s+$//g;
+
+    # Wenn gar kein Output kommt: nicht blind "running" sagen, aber rc==0 tolerieren
+    if ($txt eq '') {
+        return (defined $rc && $rc == 0) ? 'unknown-ok' : 'unknown-fail';
+    }
 
     # 1) Running Muster (postmulti/postfix-script/systemctl)
     return 'running' if $txt =~ /\bis\s+running\b/;
@@ -736,7 +742,7 @@ sub backup_file {
     $logger->info("Erstelle Backup von $file nach $dst");
     try {
         my $data = path($file)->slurp;
-        path($dst)->spurt($data);
+        path($dst)->spew($data);
         my $bk_mode = effective_backup_mode();
         my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
         $logger->info("Set owner/mode for $dst: user=$global->{serviceUser} group=$global->{serviceGroup} mode=$bk_mode");
