@@ -21,9 +21,9 @@ TemporaryFileSystem=/
 # 2. Notwendige System-Ordner für Perl und Postmap (Read-Only)
 BindReadOnlyPaths=/usr /lib /lib64 /bin /sbin /etc/alternatives /etc/perl /etc/ssl/certs
 
-# 3. Die Konfiguration des Agenten (Read-Only)
+# 3. Die Konfiguration des Agenten 
 BindReadOnlyPaths=/opt/postfix-agent/global.json
-BindReadOnlyPaths=/opt/postfix-agent/configs.json
+BindPaths=/opt/postfix-agent/configs.json
 
 # 4. Arbeitsverzeichnisse für Postfix (Read-Write)
 # Hier liegen die Maps (virtual, aliases, etc.)
@@ -61,4 +61,5 @@ PrivateDevices=yes
 [Install]
 
 WantedBy=multi-user.target
+
 
