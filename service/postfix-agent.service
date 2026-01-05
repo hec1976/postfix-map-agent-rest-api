@@ -31,7 +31,7 @@ BindPaths=/etc/postfix
 
 # 5. Logging und Backups (Read-Write)
 # Erstelle diese Ordner vorher, falls sie nicht existieren!
-BindPaths=/var/log/mmbb
+BindPaths=/var/log
 BindPaths=/var/backups/postfix-agent
 
 # 6. Temporäre Dateien und Locks (isoliert)
@@ -61,3 +61,4 @@ PrivateDevices=yes
 [Install]
 
 WantedBy=multi-user.target
+
