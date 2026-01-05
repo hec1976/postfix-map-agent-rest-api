@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.7 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.8 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -429,16 +429,22 @@ sub parse_service_status {
     return 'running' if $txt =~ /\bthe\s+postfix\s+mail\s+system\s+is\s+running\b/;
     return 'running' if $txt =~ /\bpid:\s*\d+\b/;
     return 'running' if $txt =~ /[\w\-\.\/]+:\s*(?:the\s+postfix\s+mail\s+system\s+is\s+)?running\b/;
-    return 'running' if $txt =~ /\brunning\b/;
     return 'running' if $txt =~ /\bactive\b/;
 
     # 2) Stopped Muster
-    return 'stopped' if $txt =~ /\bnot\s+running\b/;
-    return 'stopped' if $txt =~ /\binactive\b/;
-    return 'stopped' if $txt =~ /\bstopp?ed\b/;
+    # Wichtig: bei postmulti/postfix-script kommt in der Praxis manchmal rc=0, obwohl Text "not running" sagt.
+    # In dem Fall nicht hart "stopped" liefern, sondern 'unknown-ok', damit der Aufrufer tolerant entscheiden kann.
+    if ($txt =~ /\bnot\s+running\b/
+        || $txt =~ /\binactive\b/
+        || $txt =~ /\bstopp?ed\b/
+        || $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/) {
+
+        return 'unknown-ok' if defined $rc && $rc == 0;
+        return 'stopped';
+    }
+
     return 'stopped' if $txt =~ /\bdead\b/;
     return 'stopped' if $txt =~ /\bfailed\b/;
-    return 'stopped' if $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/;
 
     # 3) Fallback via Exit-Code (bei manchen Wrappern ist der Text unzuverlaessig)
     return 'running' if defined $rc && $rc == 0;
