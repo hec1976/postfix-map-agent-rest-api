@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.3 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.4 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -415,6 +415,23 @@ sub get_instance_or_render {
 
     return ($inst, $ci);
 }
+
+# Status-Parser (systemctl, postmulti, postfix-script)
+# Ziel: "running" sicher erkennen, auch wenn Prefix davor steht
+sub parse_service_status {
+    my ($out, $rc) = @_;
+    my $txt = lc(($out // ''));
+    $txt =~ s/\r//g;
+
+    return 'stopped' if $txt =~ /\bnot\s+running\b/;
+    return 'stopped' if $txt =~ /\bstopp?ed\b/;
+    return 'running' if $txt =~ /\brunning\b/;
+    return 'running' if $txt =~ /\bactive\b/;
+
+    # Fallback: rc==0 aber Text nicht eindeutig
+    return ($rc == 0) ? 'unknown-ok' : 'unknown-fail';
+}
+
 
 sub _looks_like_instance_node {
   my ($h) = @_;
@@ -1060,12 +1077,14 @@ post '/instances/:inst/map/*map' => sub {
                                         executed => 1, command => $status_cmd,
                                         rc => $status_rc, output => $status_out,
                                     };
-                                    if ( ($status_out =~ /is\s+running/i && $status_rc == 0)
-                                      || ($status_out =~ /^active/i      && $status_rc == 0)
-                                      || ($status_out =~ /^running/i     && $status_rc == 0) ) {
-                                        $result{status}{result} = 'running';
-                                        return 1;
-                                    }
+                                    my $st = parse_service_status($status_out, $status_rc);
+                                    $result{status}{result} = $st;
+
+                                    return 1 if $st eq 'running';
+
+                                    # Toleranz wie frueher: rc==0 aber Output nicht eindeutig -> nicht hart failen
+                                    return 1 if $st eq 'unknown-ok';
+
                                     die "Status not running (rc=$status_rc): $status_out";
                                 });
                             });
@@ -1200,13 +1219,15 @@ post '/instances/:inst/restore/*backupfile' => sub {
                                     executed => 1, command => $status_cmd,
                                     rc => $status_rc, output => $status_out,
                                 };
-                                if ( ($status_out =~ /is\s+running/i && $status_rc == 0)
-                                  || ($status_out =~ /^active/i      && $status_rc == 0)
-                                  || ($status_out =~ /^running/i     && $status_rc == 0) ) {
-                                    $result{status}{result} = 'running';
-                                    return 1;
-                                }
-                                die "Status not running (rc=$status_rc): $status_out";
+                                my $st = parse_service_status($status_out, $status_rc);
+                                    $result{status}{result} = $st;
+
+                                    return 1 if $st eq 'running';
+
+                                    # Toleranz wie frueher: rc==0 aber Output nicht eindeutig -> nicht hart failen
+                                    return 1 if $st eq 'unknown-ok';
+
+                                    die "Status not running (rc=$status_rc): $status_out";
                             });
                         });
                     } else {
