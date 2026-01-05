@@ -1,0 +1,59 @@
+[Unit]
+Description=Postfix Management Agent API
+After=network.target postfix.service
+
+[Service]
+# Pfad zum Skript und Start-Kommando
+ExecStart=/usr/bin/perl /opt/postfix-agent/agent.pl
+WorkingDirectory=/opt/postfix-agent
+Restart=always
+User=root
+Group=root
+
+# --- Sicherheits-Sandboxing ---
+
+# 1. Das gesamte Dateisystem als leer (tmpfs) mounten
+TemporaryFileSystem=/
+
+# 2. Notwendige System-Ordner für Perl und Postmap (Read-Only)
+BindReadOnlyPaths=/usr /lib /lib64 /bin /sbin /etc/alternatives /etc/perl /etc/ssl/certs
+
+# 3. Die Konfiguration des Agenten (Read-Only)
+BindReadOnlyPaths=/opt/postfix-agent/global.json
+BindReadOnlyPaths=/opt/postfix-agent/configs.json
+
+# 4. Arbeitsverzeichnisse für Postfix (Read-Write)
+# Hier liegen die Maps (virtual, aliases, etc.)
+BindPaths=/etc/postfix
+
+# 5. Logging und Backups (Read-Write)
+# Erstelle diese Ordner vorher, falls sie nicht existieren!
+BindPaths=/var/log/mmbb
+BindPaths=/var/backups/postfix-agent
+
+# 6. Temporäre Dateien und Locks (isoliert)
+PrivateTmp=yes
+# Falls ein spezieller Lock-Ordner in der global.json definiert ist:
+BindPaths=/tmp
+
+# --- Weitere Kernel-Härtung ---
+
+# Verhindert, dass der Prozess neue Privilegien erlangt
+NoNewPrivileges=yes
+
+# Schützt Kernel-Einstellungen und Control-Groups
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+
+# Macht /home und /root komplett unsichtbar
+ProtectHome=yes
+
+# Verhindert Zugriff auf physische Geräte (außer /dev/null, /dev/random)
+PrivateDevices=yes
+
+# Beschränkt die Systemaufrufe (optional, falls postmap Probleme macht, weglassen)
+# SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target
