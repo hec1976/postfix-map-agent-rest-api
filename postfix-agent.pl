@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.4 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.5 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -64,7 +64,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.3';
+our $VERSION = '1.5.5';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -1082,8 +1082,13 @@ post '/instances/:inst/map/*map' => sub {
 
                                     return 1 if $st eq 'running';
 
-                                    # Toleranz wie frueher: rc==0 aber Output nicht eindeutig -> nicht hart failen
-                                    return 1 if $st eq 'unknown-ok';
+                                    # Toleranz wie frueher: wenn rc==0, dann nicht hart abbrechen.
+                                    # postmulti/postfix-script liefert je nach Zustand/Wrapper manchmal rc=0 auch bei "not running".
+                                    if ($status_rc == 0) {
+                                        $result{status}{warning} = 'Status not running but rc=0 (tolerated)';
+                                        $result{status}{output}  = $status_out;
+                                        return 1;
+                                    }
 
                                     die "Status not running (rc=$status_rc): $status_out";
                                 });
