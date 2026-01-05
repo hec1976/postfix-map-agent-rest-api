@@ -117,10 +117,7 @@ sub run_cmd_subprocess_p {
     my ($cmd_str) = @_;
     $cmd_str =~ s/^\s+|\s+$//g;
 
-    # Zerlegt den String in eine Liste, z.B.:
-    # "/usr/sbin/postmap /etc/map" -> ("/usr/sbin/postmap", "/etc/map")
     my @cmd = shellwords($cmd_str);
-
     return Mojo::Promise->reject('empty command') unless @cmd;
 
     my $p  = Mojo::Promise->new;
@@ -129,17 +126,11 @@ sub run_cmd_subprocess_p {
     $sp->run(
         sub {
             my ($subproc) = @_;
-
-            # STDERR auf STDOUT umleiten, damit wir beides einfangen (entspricht 2>&1)
             open(local *STDERR, ">&", STDOUT) or die "Can't dup STDOUT: $!";
-
-            # Öffne Pipe vom Befehl in Listenform -> KEINE Shell-Interpretation von ; | & etc.
             open(my $fh, "-|", @cmd) or die "Can't execute @cmd: $!";
-
             my $output = do { local $/; <$fh> };
             close($fh);
             my $rc = $? >> 8;
-
             return { rc => $rc, output => $output // '' };
         },
         sub {
@@ -154,7 +145,6 @@ sub run_cmd_subprocess_p {
 sub run_promise {
     my ($c, $cb) = @_;
     $c->render_later;
-
     return Mojo::Promise->resolve
         ->then(sub { $cb->(); })
         ->catch(sub {
@@ -165,7 +155,7 @@ sub run_promise {
         });
 }
 
-# Logfile-Owner/Group nachziehen (Modus via umask/UMask)
+# Logfile-Owner/Group nachziehen
 eval {
     set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup});
 };
@@ -223,7 +213,7 @@ sub effective_backup_dir {
     my ($ci, $inst) = @_;
     return $ci->{backup_dir} if $ci && $ci->{backup_dir};
     return path($global->{backupDir}, $inst)->to_string if $global->{backupDir};
-    return; # kein Fallback
+    return;
 }
 
 # Globale Dienstverzeichnisse anlegen/absichern
@@ -264,23 +254,20 @@ if (my $dconf = $global->{dirs}) {
 my $tmp_dir = $global->{tmpDir} // '/tmp';
 unless (-d $tmp_dir) { eval { path($tmp_dir)->make_path }; die "Konnte tmp_dir $tmp_dir nicht anlegen: $@" if $@; }
 
-# Zusammengeführte Config (mutable via reload_config / _rebuild_cfgmap_from)
+# Zusammengeführte Config
 my $config = { global => $global, instances => $instances };
 
 # -------------------- Atomare Writes --------------------
 sub _atomic_write_impl {
     my ($target, $content, $user, $group, $mode, $umask_only) = @_;
-
     my $dir = path($target)->dirname->to_string;
     die "Verzeichnis nicht beschreibbar: $dir" unless -w $dir;
 
     my $tmpfile;
     my $max_tries = 128;
-
     for (1..$max_tries) {
         my $rand = int(rand(1_000_000_000));
         my $candidate = path($dir)->child(".tmp_${$}_$rand")->to_string;
-
         if (sysopen(my $fh, $candidate, O_CREAT|O_EXCL|O_WRONLY, 0666)) {
             binmode($fh, ':encoding(UTF-8)');
             print $fh $content;
@@ -289,24 +276,19 @@ sub _atomic_write_impl {
             last;
         }
     }
-
     die "atomic_write: konnte keine Temp-Datei erstellen in $dir" unless $tmpfile;
 
-    # Ownership setzen, Mode nur wenn NICHT umask-only gewünscht
     if ($umask_only) {
         set_file_ownership_and_mode($tmpfile, $user, $group);
     } else {
         set_file_ownership_and_mode($tmpfile, $user, $group, $mode);
     }
-
     rename $tmpfile, $target or die "rename($tmpfile -> $target) failed: $!";
-
     if ($umask_only) {
         set_file_ownership_and_mode($target, $user, $group);
     } else {
         set_file_ownership_and_mode($target, $user, $group, $mode);
     }
-
     return 1;
 }
 
@@ -327,111 +309,74 @@ sub normalize_inst {
     return $inst;
 }
 
-# Instanz-Auflösung analog zur alten Logik:
-# - Wenn Instanz angegeben: verwenden (Unknown -> später 404)
-# - Wenn Instanz fehlt oder "default" ist und es genau 1 Instanz gibt: diese eine nehmen
-# - Wenn Instanz fehlt und mehrere existieren: Fehler (Instance required)
 sub resolve_inst_name {
     my ($inst_in) = @_;
     my $inst = normalize_inst($inst_in);
-
     my @names = sort keys %{ $config->{instances} // {} };
-
-    # kein inst angegeben
     if ($inst eq '') {
         return $names[0] if @names == 1;
         return '';
     }
-
-    # "default" als bequemer Alias, aber nur wenn genau eine Instanz existiert
     if ($inst eq 'default' && !exists $config->{instances}{default} && @names == 1) {
         return $names[0];
     }
-
     return $inst;
 }
 
 sub get_instance_or_render {
     my ($c, $inst_in) = @_;
     my $inst = resolve_inst_name($inst_in);
-
     if (!defined $inst || $inst eq '') {
         $c->render(status => 400, json => { ok => 0, error => 'Instance required' });
         return;
     }
-
     my $ci = $config->{instances}{$inst};
     unless ($ci) {
         $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' });
         return;
     }
-
     return ($inst, $ci);
 }
 
-# Status-Parser (systemctl, postmulti, postfix-script)
-# Ziel: "running" sicher erkennen, auch wenn Prefix davor steht
 sub parse_service_status {
     my ($out, $rc) = @_;
-
     my $txt = lc(($out // ''));
     $txt =~ s/\r//g;
     $txt =~ s/^\s+|\s+$//g;
-
-    # Wenn gar kein Output kommt: nicht blind "running" sagen, aber rc==0 tolerieren
     if ($txt eq '') {
         return (defined $rc && $rc == 0) ? 'unknown-ok' : 'unknown-fail';
     }
-
-    # 1) Running Muster (postmulti/postfix-script/systemctl)
     return 'running' if $txt =~ /\bis\s+running\b/;
     return 'running' if $txt =~ /\bthe\s+postfix\s+mail\s+system\s+is\s+running\b/;
     return 'running' if $txt =~ /\bpid:\s*\d+\b/;
     return 'running' if $txt =~ /[\w\-\.\/]+:\s*(?:the\s+postfix\s+mail\s+system\s+is\s+)?running\b/;
     return 'running' if $txt =~ /\bactive\b/;
-
-    # 2) Stopped Muster
-    # Wichtig: bei postmulti/postfix-script kommt in der Praxis manchmal rc=0, obwohl Text "not running" sagt.
-    # In dem Fall nicht hart "stopped" liefern, sondern 'unknown-ok', damit der Aufrufer tolerant entscheiden kann.
-    if ($txt =~ /\bnot\s+running\b/
-        || $txt =~ /\binactive\b/
-        || $txt =~ /\bstopp?ed\b/
-        || $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/) {
-
+    if ($txt =~ /\bnot\s+running\b/ || $txt =~ /\binactive\b/ || $txt =~ /\bstopp?ed\b/ || $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/) {
         return 'unknown-ok' if defined $rc && $rc == 0;
         return 'stopped';
     }
-
     return 'stopped' if $txt =~ /\bdead\b/;
     return 'stopped' if $txt =~ /\bfailed\b/;
-
-    # 3) Fallback via Exit-Code (bei manchen Wrappern ist der Text unzuverlässig)
     return 'running' if defined $rc && $rc == 0;
     return 'stopped' if defined $rc && $rc == 1;
-
     return 'unknown-fail';
 }
 
 sub _looks_like_instance_node {
-  my ($h) = @_;
-  return 0 unless $h && ref($h) eq 'HASH';
-  for my $k (qw(map_dir config_dir globs postmap_by_type reload_cmd status_cmd backup_dir lock_dir)) {
-    return 1 if exists $h->{$k};
-  }
-  return 0;
+    my ($h) = @_;
+    return 0 unless $h && ref($h) eq 'HASH';
+    for my $k (qw(map_dir config_dir globs postmap_by_type reload_cmd status_cmd backup_dir lock_dir)) {
+        return 1 if exists $h->{$k};
+    }
+    return 0;
 }
 
 sub wrap_instances_hash_if_needed {
-  my ($insts) = @_;
-  return $insts unless $insts && ref($insts) eq 'HASH';
-
-  # Wenn es bereits wie instances->{default} aussieht, nichts tun
-  return $insts if exists $insts->{default};
-
-  # Wenn es wie eine Single-Instanz aussieht, als default wrappen
-  return { default => $insts } if _looks_like_instance_node($insts);
-
-  return $insts;
+    my ($insts) = @_;
+    return $insts unless $insts && ref($insts) eq 'HASH';
+    return $insts if exists $insts->{default};
+    return { default => $insts } if _looks_like_instance_node($insts);
+    return $insts;
 }
 
 # -------------------- Netz & Auth --------------------
@@ -441,7 +386,6 @@ my $ssl_cert      = $config->{global}{ssl_cert_file} // '';
 my $ssl_key       = $config->{global}{ssl_key_file}  // '';
 my $require_https = $config->{global}{require_https} // 0;
 
-# API-Token ist Pflicht (hart)
 my $api_token = $ENV{API_TOKEN} // ($global->{api_token} // '');
 die "FATAL: API_TOKEN nicht gesetzt (ENV API_TOKEN oder global.json api_token)\n"
     unless defined $api_token && length $api_token;
@@ -476,11 +420,10 @@ hook before_dispatch => sub {
     }
 };
 
-# -------------------- JSON Helpers (Mojo::JSON, canonical + pretty) --------------------
+# -------------------- JSON Helpers --------------------
 sub _json_canonicalize {
     my ($v) = @_;
     return $v unless ref $v;
-
     if (ref $v eq 'HASH') {
         my %out;
         for my $k (sort keys %$v) {
@@ -496,18 +439,14 @@ sub _json_canonicalize {
 
 sub _json_pretty {
     my ($json) = @_;
-    # Simple JSON pretty printer (string-safe), no external deps.
     my $out = '';
     my $indent = 0;
     my $in_str = 0;
     my $esc = 0;
-
     my $nl = "\n";
     my $sp = '  ';
-
     for (my $i = 0; $i < length($json); $i++) {
         my $ch = substr($json, $i, 1);
-
         if ($in_str) {
             $out .= $ch;
             if ($esc) { $esc = 0; next; }
@@ -515,11 +454,8 @@ sub _json_pretty {
             if ($ch eq '"') { $in_str = 0; next; }
             next;
         }
-
         if ($ch eq '"') { $in_str = 1; $out .= $ch; next; }
-
         if ($ch =~ /\s/) { next; }
-
         if ($ch eq '{' || $ch eq '[') {
             $out .= $ch . $nl;
             $indent++;
@@ -540,10 +476,8 @@ sub _json_pretty {
             $out .= $ch . ' ';
             next;
         }
-
         $out .= $ch;
     }
-
     $out .= $nl unless $out =~ /\n\z/;
     return $out;
 }
@@ -555,7 +489,7 @@ sub json_encode_pretty_canonical {
     return _json_pretty($min);
 }
 
-# -------------------- Config-Helfer (reload & raw read/write) ----------------
+# -------------------- Config-Helfer --------------------
 sub reload_config {
     my $raw_global    = decode_json( read_text($global_cfg_file) );
     my $raw_instances = decode_json( read_text($instances_cfg_file) );
@@ -591,7 +525,7 @@ sub _write_cfg_hash_atomic {
 sub _rebuild_cfgmap_from {
     my ($cfg) = @_;
     my $insts = (ref($cfg->{instances}) eq 'HASH') ? $cfg->{instances} : $cfg;
-  $insts = wrap_instances_hash_if_needed($insts);
+    $insts = wrap_instances_hash_if_needed($insts);
     $instances = $insts;
     $config->{instances} = $insts;
 }
@@ -603,16 +537,12 @@ sub sanitize_map_name {
     my ($raw) = @_;
     my $name = path($raw // '')->basename;
     return (undef, 'Empty name') unless defined $name && length $name;
-
-    # Nur simple Dateinamen erlauben
     return (undef, 'Invalid characters') unless $name =~ /\A[0-9A-Za-z._-]{1,255}\z/;
-    return (undef, 'Path traversal detected') if $name =~ /\A\.+\z/;     # ".", ".."
+    return (undef, 'Path traversal detected') if $name =~ /\A\.+\z/;
     return (undef, 'Path traversal detected') if $name =~ m{[\\/]} || $name =~ /\.\./;
-
     return ($name, undef);
 }
 
-# Verbotene Dateinamen (NICHT als Maps editier-/abrufbar)
 my %FORBIDDEN = map { $_ => 1 } qw(main.cf master.cf);
 
 sub _deny_forbidden_map {
@@ -693,7 +623,7 @@ sub backup_file {
     $logger->info("Erstelle Backup von $file nach $dst");
     try {
         my $data = path($file)->slurp;
-        path($dst)->spew($data);  # spurt -> spew
+        path($dst)->spew($data);  # FIX: spurt → spew
         my $bk_mode = effective_backup_mode();
         my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
         $logger->info("Set owner/mode for $dst: user=$global->{serviceUser} group=$global->{serviceGroup} mode=$bk_mode");
@@ -712,11 +642,10 @@ sub backup_file {
     }
 }
 
-# -------------------- Locks (per Map & Instanz) --------------------
+# -------------------- Locks --------------------
 sub _lock_dir_for {
     my ($ci, $inst) = @_;
     $inst = normalize_inst($inst);
-
     return $ci->{lock_dir} if $ci && $ci->{lock_dir};
     return $config->{global}{lockDir} if $config->{global}{lockDir};
     my $base = $config->{global}{tmpDir} // '/tmp';
@@ -750,8 +679,6 @@ sub with_map_lock {
         if (flock($lfh, $want | LOCK_NB)) {
             my $ret; my $err;
             eval { $ret = $code->(); 1 } or $err = $@;
-
-            # Wenn Callback eine Promise liefert, halten wir den Lock bis zum Ende.
             if (!$err && $ret && ref($ret) && eval { $ret->isa('Mojo::Promise') }) {
                 my $p = Mojo::Promise->new;
                 $ret->then(sub {
@@ -765,7 +692,6 @@ sub with_map_lock {
                 });
                 return $p;
             }
-
             flock($lfh, LOCK_UN); close $lfh;
             die $err if $err;
             return $ret;
@@ -789,7 +715,7 @@ get '/' => sub {
 get '/instances' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        $c->render(json => { instances => [sort keys %{ $config->{instances} }]} );
+        $c->render(json => { instances => [sort keys %{ $config->{instances} }]});
     });
 };
 
@@ -824,7 +750,6 @@ get '/instances/:inst/maps' => sub {
     });
 };
 
-# Map anzeigen (Text, UTF-8)
 get '/instances/:inst/map/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -842,7 +767,6 @@ get '/instances/:inst/map/*map' => sub {
     });
 };
 
-# Backups auflisten
 get '/instances/:inst/backup/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -861,7 +785,6 @@ get '/instances/:inst/backup/*map' => sub {
     });
 };
 
-# Backup-Vorschau/-Download
 get '/instances/:inst/backupfile/*backup' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -891,7 +814,6 @@ get '/instances/:inst/backupfile/*backup' => sub {
     });
 };
 
-# Map speichern / anlegen (UTF-8)
 post '/instances/:inst/map/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -916,7 +838,6 @@ post '/instances/:inst/map/*map' => sub {
         return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
             if _deny_forbidden_map($map);
         my $path = "$ci->{map_dir}/$map";
-        # ---- Inhalt einlesen (JSON / x-www-form-urlencoded / raw) ----
         my $new_content;
         my $ct = $c->req->headers->content_type // '';
         my $json;
@@ -934,7 +855,6 @@ post '/instances/:inst/map/*map' => sub {
         $new_content //= $c->param('content');
         $new_content //= decode('UTF-8', $c->req->body // '');
         $new_content =~ s/\r\n/\n/g if defined $new_content;
-        # ---- map_dir sicherstellen ----
         my $dir = path($path)->dirname->to_string;
         unless (-d $dir) {
             eval { path($dir)->make_path };
@@ -961,7 +881,6 @@ post '/instances/:inst/map/*map' => sub {
             $result{ok} = 0; $result{error} = 'Not found or not writable';
             return $c->render(json => \%result, status => 403);
         }
-        # ---- alten Inhalt lesen ----
         my $old_content = '';
         my $read_error = 0;
         try {
@@ -973,7 +892,6 @@ post '/instances/:inst/map/*map' => sub {
             $result{ok} = 0; $result{error} = "Fehler beim Lesen: $read_error";
             return $c->render(json => \%result, status => 500);
         }
-        # ---- Minimalinhalt, wenn NEU & leerer Body ----
         if (!-e $path) {
             $new_content = "#\n" unless defined($new_content) && $new_content ne '';
         }
@@ -1000,7 +918,6 @@ post '/instances/:inst/map/*map' => sub {
                     $result{write} = 'ok';
 
                     my $p = Mojo::Promise->resolve;
-
                     if (my $pm_cmd = postmap_cmd($ci, $map, $inst)) {
                         $p = $p->then(sub {
                             return run_cmd_subprocess_p($pm_cmd)->then(sub {
@@ -1035,7 +952,6 @@ post '/instances/:inst/map/*map' => sub {
                                         rc => $reload_rc, output => $reload_out,
                                         result => 'ok',
                                     };
-
                                     if ($reload_rc != 0) {
                                         $result{reload}{result}  = 'warn';
                                         $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
@@ -1053,7 +969,7 @@ post '/instances/:inst/map/*map' => sub {
 
                         $p = $p->then(sub {
                             my $t = Mojo::Promise->new;
-                            Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # Korrekt: RELOAD_GRACE_S als Zahl
+                            Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # FIX: RELOAD_GRACE_S als Zahl
                             return $t;
                         });
 
@@ -1070,16 +986,12 @@ post '/instances/:inst/map/*map' => sub {
                                     };
                                     my $st = parse_service_status($status_out, $status_rc);
                                     $result{status}{result} = $st;
-
                                     return 1 if $st eq 'running';
-
-                                    # Toleranz wie früher: wenn rc==0, dann nicht hart abbrechen.
                                     if ($status_rc == 0) {
                                         $result{status}{warning} = 'Status not running but rc=0 (tolerated)';
                                         $result{status}{output}  = $status_out;
                                         return 1;
                                     }
-
                                     die "Status not running (rc=$status_rc): $status_out";
                                 });
                             })->catch(sub {
@@ -1091,7 +1003,6 @@ post '/instances/:inst/map/*map' => sub {
                             $result{status} = { executed => 0 };
                         }
                     }
-
                     return $p;
                 }, $inst);
                 1;
@@ -1119,7 +1030,6 @@ post '/instances/:inst/map/*map' => sub {
                     return $c->render(json => \%result, status => 500);
                 });
             }
-
             return $c->render(json => \%result);
         }
         $result{write}  = 'skipped';
@@ -1128,7 +1038,6 @@ post '/instances/:inst/map/*map' => sub {
     });
 };
 
-# --------- RESTORE ---------
 post '/instances/:inst/restore/*backupfile' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -1214,7 +1123,7 @@ post '/instances/:inst/restore/*backupfile' => sub {
 
                     $p = $p->then(sub {
                         my $t = Mojo::Promise->new;
-                        Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # Korrekt: RELOAD_GRACE_S als Zahl
+                        Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # FIX: RELOAD_GRACE_S als Zahl
                         return $t;
                     });
 
@@ -1230,14 +1139,10 @@ post '/instances/:inst/restore/*backupfile' => sub {
                                     rc => $status_rc, output => $status_out,
                                 };
                                 my $st = parse_service_status($status_out, $status_rc);
-                                    $result{status}{result} = $st;
-
-                                    return 1 if $st eq 'running';
-
-                                    # Toleranz wie früher: rc==0 aber Output nicht eindeutig -> nicht hart failen
-                                    return 1 if $st eq 'unknown-ok';
-
-                                    die "Status not running (rc=$status_rc): $status_out";
+                                $result{status}{result} = $st;
+                                return 1 if $st eq 'running';
+                                return 1 if $st eq 'unknown-ok';
+                                die "Status not running (rc=$status_rc): $status_out";
                             });
                         })->catch(sub {
                             my ($err) = @_;
@@ -1248,7 +1153,6 @@ post '/instances/:inst/restore/*backupfile' => sub {
                         $result{status} = { executed => 0 };
                     }
                 }
-
                 return $p;
             }, $inst);
             1;
@@ -1276,12 +1180,10 @@ post '/instances/:inst/restore/*backupfile' => sub {
                 return $c->render(json => \%result, status => 500);
             });
         }
-
         return $c->render(json => \%result);
     });
 };
 
-# Map deregistrieren (nur configs.json) + Hinweise
 post '/instances/:inst/delmap/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -1301,16 +1203,11 @@ post '/instances/:inst/delmap/*map' => sub {
         my $has_wrapper    = 0;
         my $node;
         try {
-            # 1. Konfigurationsdatei einlesen
             $instances_data = -e $instances_cfg_file
                 ? decode_json( read_text($instances_cfg_file) )
                 : {};
             $logger->debug("Konfiguration geladen: $instances_cfg_file");
-
-            # 2. Struktur prüfen (Wrapper oder flach)
             $has_wrapper = ref($instances_data->{instances}) eq 'HASH' ? 1 : 0;
-
-            # Node der Instanz ermitteln (Multi-Wrapper, Multi-flach, oder Single-flach als default)
             if ($has_wrapper) {
                 $node = $instances_data->{instances}{$inst};
             } else {
@@ -1323,8 +1220,6 @@ post '/instances/:inst/delmap/*map' => sub {
             unless ($node && ref($node) eq 'HASH') {
                 die "Unknown instance '$inst'";
             }
-
-            # 3. Map aus globs entfernen (falls vorhanden)
             if (ref($node->{globs}) eq 'HASH' && exists $node->{globs}{$map}) {
                 $logger->info("Entferne Map '$map' aus globs der Instanz '$inst'");
                 delete $node->{globs}{$map};
@@ -1386,7 +1281,6 @@ post '/instances/:inst/delmap/*map' => sub {
     });
 };
 
-# ======== API: globs lesen ====================================================
 get '/instances/:inst/globs' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -1400,7 +1294,6 @@ get '/instances/:inst/globs' => sub {
     });
 };
 
-# ======== API: globs upsert ===================================================
 post '/instances/:inst/globs' => sub {
     my $c = shift;
     return run_promise($c, sub {
@@ -1461,7 +1354,6 @@ post '/instances/:inst/globs' => sub {
     });
 };
 
-# ======== API: globs delete (einzelner Key) ==================================
 del '/instances/:inst/globs/:map' => sub {
     my $c    = shift;
     my $inst = resolve_inst_name($c->stash('inst'));
@@ -1478,7 +1370,6 @@ del '/instances/:inst/globs/:map' => sub {
     $c->render(json => { ok=>1, instance=>$inst, map=>$map, removed=>($had?true:false) });
 };
 
-# Health
 get '/health' => sub {
     my $c = shift;
     return run_promise($c, sub {
