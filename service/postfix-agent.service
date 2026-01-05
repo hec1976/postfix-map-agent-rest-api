@@ -10,6 +10,9 @@ Restart=always
 User=root
 Group=root
 
+# Lade die Umgebungsvariablen aus der Datei
+EnvironmentFile=/etc/postfix-agent.env
+
 # --- Sicherheits-Sandboxing ---
 
 # 1. Das gesamte Dateisystem als leer (tmpfs) mounten
@@ -56,4 +59,5 @@ PrivateDevices=yes
 # SystemCallFilter=@system-service
 
 [Install]
+
 WantedBy=multi-user.target
