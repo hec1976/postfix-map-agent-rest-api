@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.5 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.6 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -64,7 +64,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.5';
+our $VERSION = '1.5.6';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -420,17 +420,33 @@ sub get_instance_or_render {
 # Ziel: "running" sicher erkennen, auch wenn Prefix davor steht
 sub parse_service_status {
     my ($out, $rc) = @_;
+
     my $txt = lc(($out // ''));
     $txt =~ s/\r//g;
 
-    return 'stopped' if $txt =~ /\bnot\s+running\b/;
-    return 'stopped' if $txt =~ /\bstopp?ed\b/;
+    # 1) Running Muster (postmulti/postfix-script/systemctl)
+    return 'running' if $txt =~ /\bis\s+running\b/;
+    return 'running' if $txt =~ /\bthe\s+postfix\s+mail\s+system\s+is\s+running\b/;
+    return 'running' if $txt =~ /\bpid:\s*\d+\b/;
+    return 'running' if $txt =~ /[\w\-\.\/]+:\s*(?:the\s+postfix\s+mail\s+system\s+is\s+)?running\b/;
     return 'running' if $txt =~ /\brunning\b/;
     return 'running' if $txt =~ /\bactive\b/;
 
-    # Fallback: rc==0 aber Text nicht eindeutig
-    return ($rc == 0) ? 'unknown-ok' : 'unknown-fail';
+    # 2) Stopped Muster
+    return 'stopped' if $txt =~ /\bnot\s+running\b/;
+    return 'stopped' if $txt =~ /\binactive\b/;
+    return 'stopped' if $txt =~ /\bstopp?ed\b/;
+    return 'stopped' if $txt =~ /\bdead\b/;
+    return 'stopped' if $txt =~ /\bfailed\b/;
+    return 'stopped' if $txt =~ /[\w\-\.\/]+:\s*not\s+running\b/;
+
+    # 3) Fallback via Exit-Code (bei manchen Wrappern ist der Text unzuverlaessig)
+    return 'running' if defined $rc && $rc == 0;
+    return 'stopped' if defined $rc && $rc == 1;
+
+    return 'unknown-fail';
 }
+
 
 
 sub _looks_like_instance_node {
