@@ -16,6 +16,6 @@
   "reload_grace_s": 0.01,
   "dirs": {
     "service_mode": "0770",
-    "service_folder": []
+    "service_folder": ["backupDir", "lockDir"]
   }
 }
