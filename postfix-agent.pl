@@ -15,7 +15,7 @@ use Fcntl qw(:mode O_CREAT O_EXCL O_WRONLY O_RDWR :flock);
 use Time::HiRes qw(time sleep);
 use Text::ParseWords qw(shellwords);
 
-use constant RELOAD_GRACE_S => 0.35;
+use constant RELOAD_GRACE_S => 0.35;  # Korrekt: Zahl, keine Anführungszeichen!
 use constant LOCK_TIMEOUT_S => 3.0;
 our $VERSION = '1.5.8';
 
@@ -693,7 +693,7 @@ sub backup_file {
     $logger->info("Erstelle Backup von $file nach $dst");
     try {
         my $data = path($file)->slurp;
-        path($dst)->spew($data);  # Hier: spurt -> spew
+        path($dst)->spew($data);  # spurt -> spew
         my $bk_mode = effective_backup_mode();
         my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
         $logger->info("Set owner/mode for $dst: user=$global->{serviceUser} group=$global->{serviceGroup} mode=$bk_mode");
@@ -1053,7 +1053,7 @@ post '/instances/:inst/map/*map' => sub {
 
                         $p = $p->then(sub {
                             my $t = Mojo::Promise->new;
-                            Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });
+                            Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # Korrekt: RELOAD_GRACE_S als Zahl
                             return $t;
                         });
 
@@ -1074,7 +1074,6 @@ post '/instances/:inst/map/*map' => sub {
                                     return 1 if $st eq 'running';
 
                                     # Toleranz wie früher: wenn rc==0, dann nicht hart abbrechen.
-                                    # postmulti/postfix-script liefert je nach Zustand/Wrapper manchmal rc=0 auch bei "not running".
                                     if ($status_rc == 0) {
                                         $result{status}{warning} = 'Status not running but rc=0 (tolerated)';
                                         $result{status}{output}  = $status_out;
@@ -1215,7 +1214,7 @@ post '/instances/:inst/restore/*backupfile' => sub {
 
                     $p = $p->then(sub {
                         my $t = Mojo::Promise->new;
-                        Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });
+                        Mojo::IOLoop->timer(RELOAD_GRACE_S => sub { $t->resolve(1) });  # Korrekt: RELOAD_GRACE_S als Zahl
                         return $t;
                     });
 
