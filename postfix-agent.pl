@@ -21,11 +21,16 @@ use constant LOCK_TIMEOUT_S  => 3.0;
 
 sub _num_seconds {
     my ($v, $default) = @_;
-    return $default unless defined $v;
-    # akzeptiert 0.35, 1, "2.0"
-    return $v + 0 if $v =~ /\A\d+(?:\.\d+)?\z/;
-    return $default;
+    $default //= 0.35; 
+    # Erzwinge numerischen Kontext für den Default (verhindert den Fehler im Log)
+    my $fallback = $default + 0; 
+    
+    if (defined $v && $v =~ /\A\d+(?:\.\d+)?\z/) {
+        return $v + 0;
+    }
+    return $fallback;
 }
+
 
 our $VERSION = '1.6.0';
 
@@ -858,10 +863,18 @@ sub _status_verify_p {
             $result->{status}{warning} = "Status meldet '$st' (rc=$status_rc)";
             return 1;
         });
-    })->catch(sub {
+	})->catch(sub {
         my ($err) = @_;
-        $result->{status} = { executed => 1, result => 'fail', error => "$err" };
-        return 1;
+        # Wir loggen den Fehler, damit er nicht verschwindet
+        $logger->warn("Status-Check fehlgeschlagen: $err"); 
+        
+        $result->{status} = { 
+            executed => 1, 
+            result   => 'fail', 
+            error    => "$err" 
+        };
+        # Das hier verhindert den "Unhandled rejected promise" Fehler:
+        return Mojo::Promise->resolve(1); 
     });
 
     return $p;
