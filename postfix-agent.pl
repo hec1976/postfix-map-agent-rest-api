@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.8 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.9 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -64,7 +64,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.7';
+our $VERSION = '1.5.9';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
