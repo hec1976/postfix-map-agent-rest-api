@@ -1,5 +1,5 @@
 # Postfix Map Agent - REST
-# Version: 1.5.6 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.7 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
 # - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
@@ -64,7 +64,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.6';
+our $VERSION = '1.5.7';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -1066,9 +1066,13 @@ post '/instances/:inst/map/*map' => sub {
                                     $result{reload} = {
                                         executed => 1, command => $reload_cmd,
                                         rc => $reload_rc, output => $reload_out,
-                                        result => ($reload_rc == 0) ? 'ok' : 'fail',
+                                        result => 'ok',
                                     };
-                                    die "reload rc=$reload_rc: $reload_out" if $reload_rc != 0;
+                                    
+                                    if ($reload_rc != 0) {
+                                        $result{reload}{result}  = 'warn';
+                                        $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
+                                    }
                                     return 1;
                                 });
                             });
@@ -1213,10 +1217,13 @@ post '/instances/:inst/restore/*backupfile' => sub {
                                 $result{reload} = {
                                     executed => 1, command => $reload_cmd,
                                     rc => $reload_rc, output => $reload_out,
-                                    result => ($reload_rc == 0) ? 'ok' : 'fail',
+                                    result => 'ok',
                                 };
-                                die "reload rc=$reload_rc: $reload_out" if $reload_rc != 0;
-                                return 1;
+                                if ($reload_rc != 0) {
+                                    $result{reload}{result}  = 'warn';
+                                    $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
+                                }
+return 1;
                             });
                         });
                     } else {
