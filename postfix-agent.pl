@@ -1,51 +1,4 @@
-# Postfix Map Agent - REST
-# Version: 1.5.9 (2026-01-05, Mojo-only, async subprocess)
-#
-# Fixes ggü. 1.5.1:
-# - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
-# - "default" wird bei Single als Alias akzeptiert, falls keine echte default Instanz existiert
-# - reload_config und _rebuild_cfgmap_from halten die Instanz-Map konsistent (kein Single-Break nach Reload/Write)
-# - Locks/FS arbeiten immer mit dem effektiv aufgeloesten Instanznamen
-# - Lesefehler-Ausgaben robuster: read_raw/read_text melden $@ oder $! (Mojo File Fehler landen oft in $@)
-
-# Verhalten:
-# - Logik analog zu 1.3.x: Single ohne "default"-Key funktioniert wieder wie gewohnt, Multi verlangt eine eindeutige Instanz
-# - Multi-Instanz Verhalten bleibt unveraendert
-# Version: 1.5.1 (2026-01-04, Mojo-only, async subprocess)
-#
-# Änderungen ggü. 1.3.3:
-# - Logging umgestellt auf Mojo::Log (keine Log4perl-Abhaengigkeit mehr)
-# - Log-Format kompatibel gehalten: YYYY/MM/DD HH:MM:SS LEVEL Nachricht
-#
-# Änderungen ggü. 1.3.2:
-# - Per-Map flock: Instanz in Lock-Pfad einbezogen (Bugfix: $inst an with_map_lock übergeben)
-# - Lock-Timeout jetzt hochauflösend (Time::HiRes::time), Poll-Intervall bleibt 50ms
-# - Aufräumen: Fcntl-Import konsolidiert
-#
-# Änderungen ggü. 1.3.1:
-# - No-FS-delete Policy: delmap deregistriert NUR configs.json und liefert Hinweise
-#
-# Änderungen ggü. 1.3.0:
-# - API_TOKEN Pflicht: Start bricht ab, wenn weder ENV(API_TOKEN) noch global.json(api_token) gesetzt
-# - Backup-Rotation nach mtime statt Stringsortierung (stabil bei untypischen Dateinamen)
-# - atomic_write_umask robuster: mehr Versuche, sauberes Logging, Fallback auf File::Temp falls O_EXCL scheitert
-# - Konsistentes Logging (Mojo::Log) statt warn
-# - Statuserkennung erweitert (/(?:is\s+running|^active|^running)/)
-# - Löschen aus globs nur bei EXAKTEM Key-Match (Patterns bleiben unangetastet)
-# - Kleines Cleanup: chmod/chown nur, wenn Parameter wirklich gesetzt (kein sprintf auf undef)
-# - Optional: require_https (global.json) erzwingt HTTPS-Start
-#
-# Kurzbeschreibung:
-# - Liest/schreibt Postfix-Map-Dateien (UTF-8) atomar
-# - Timestamp-Backups mit Rotation (mtime-basiert)
-# - postmap nur für lmdb; regexp/pcre ohne Build-Schritt
-# - Optionaler Reload/Status via systemd oder postmulti (pro Instanz konfigurierbar)
-# - ACL (CIDR) + X-API-Token; Owner/Mode aus global.json (fileMode_*)
-# - Umask-only für config/tmp/log (chmod über umask/UMask)
-# - **WICHTIG: Diese API löscht KEINE Dateien auf dem Postfix-Dateisystem.**
-#   `delmap` deregistriert ausschliesslich in configs.json und liefert Hinweise,
-#   was manuell in main.cf/master.cf zu bereinigen und ggf. zu löschen ist.
-
+#!/usr/bin/env perl
 use strict;
 use warnings;
 use Mojolicious::Lite;
@@ -64,7 +17,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.9';
+our $VERSION = '1.5.8';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -111,7 +64,7 @@ my $instances      = (ref($instances_raw->{instances}) eq 'HASH')
                      ? $instances_raw->{instances}
                      : $instances_raw;
 
-# Rueckwaerts kompatibel: Single-Format als default behandeln
+# Rückwärts kompatibel: Single-Format als default behandeln
 $instances = wrap_instances_hash_if_needed($instances);
 
 # Harte Defaults für globale Berechtigungen (nur falls nicht gesetzt)
@@ -135,7 +88,7 @@ eval {
     open my $lfh, '>>', $logfile or die $!;
     close $lfh;
     1;
-} or die "Kann Logfile $logfile nicht oeffnen: $@";
+} or die "Kann Logfile $logfile nicht öffnen: $@";
 
 my $logger = Mojo::Log->new(path => $logfile, level => 'info');
 
@@ -339,7 +292,7 @@ sub _atomic_write_impl {
 
     die "atomic_write: konnte keine Temp-Datei erstellen in $dir" unless $tmpfile;
 
-    # Ownership setzen, Mode nur wenn NICHT umask-only gewuenscht
+    # Ownership setzen, Mode nur wenn NICHT umask-only gewünscht
     if ($umask_only) {
         set_file_ownership_and_mode($tmpfile, $user, $group);
     } else {
@@ -374,8 +327,8 @@ sub normalize_inst {
     return $inst;
 }
 
-# Instanz-Aufloesung analog zur alten Logik:
-# - Wenn Instanz angegeben: verwenden (Unknown -> spaeter 404)
+# Instanz-Auflösung analog zur alten Logik:
+# - Wenn Instanz angegeben: verwenden (Unknown -> später 404)
 # - Wenn Instanz fehlt oder "default" ist und es genau 1 Instanz gibt: diese eine nehmen
 # - Wenn Instanz fehlt und mehrere existieren: Fehler (Instance required)
 sub resolve_inst_name {
@@ -452,14 +405,12 @@ sub parse_service_status {
     return 'stopped' if $txt =~ /\bdead\b/;
     return 'stopped' if $txt =~ /\bfailed\b/;
 
-    # 3) Fallback via Exit-Code (bei manchen Wrappern ist der Text unzuverlaessig)
+    # 3) Fallback via Exit-Code (bei manchen Wrappern ist der Text unzuverlässig)
     return 'running' if defined $rc && $rc == 0;
     return 'stopped' if defined $rc && $rc == 1;
 
     return 'unknown-fail';
 }
-
-
 
 sub _looks_like_instance_node {
   my ($h) = @_;
@@ -742,7 +693,7 @@ sub backup_file {
     $logger->info("Erstelle Backup von $file nach $dst");
     try {
         my $data = path($file)->slurp;
-        path($dst)->spew($data);
+        path($dst)->spew($data);  # Hier: spurt -> spew
         my $bk_mode = effective_backup_mode();
         my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
         $logger->info("Set owner/mode for $dst: user=$global->{serviceUser} group=$global->{serviceGroup} mode=$bk_mode");
@@ -1064,6 +1015,10 @@ post '/instances/:inst/map/*map' => sub {
                                 die "postmap rc=$pm_rc: $pm_out" if $pm_rc != 0;
                                 return 1;
                             });
+                        })->catch(sub {
+                            my ($err) = @_;
+                            $result{postmap} = { executed => 1, result => 'fail', error => "$err" };
+                            return 1;
                         });
                     }
 
@@ -1080,13 +1035,17 @@ post '/instances/:inst/map/*map' => sub {
                                         rc => $reload_rc, output => $reload_out,
                                         result => 'ok',
                                     };
-                                    
+
                                     if ($reload_rc != 0) {
                                         $result{reload}{result}  = 'warn';
                                         $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
                                     }
                                     return 1;
                                 });
+                            })->catch(sub {
+                                my ($err) = @_;
+                                $result{reload} = { executed => 1, result => 'fail', error => "$err" };
+                                return 1;
                             });
                         } else {
                             $result{reload} = { executed => 0 };
@@ -1114,7 +1073,7 @@ post '/instances/:inst/map/*map' => sub {
 
                                     return 1 if $st eq 'running';
 
-                                    # Toleranz wie frueher: wenn rc==0, dann nicht hart abbrechen.
+                                    # Toleranz wie früher: wenn rc==0, dann nicht hart abbrechen.
                                     # postmulti/postfix-script liefert je nach Zustand/Wrapper manchmal rc=0 auch bei "not running".
                                     if ($status_rc == 0) {
                                         $result{status}{warning} = 'Status not running but rc=0 (tolerated)';
@@ -1124,6 +1083,10 @@ post '/instances/:inst/map/*map' => sub {
 
                                     die "Status not running (rc=$status_rc): $status_out";
                                 });
+                            })->catch(sub {
+                                my ($err) = @_;
+                                $result{status} = { executed => 1, result => 'fail', error => "$err" };
+                                return 1;
                             });
                         } else {
                             $result{status} = { executed => 0 };
@@ -1213,6 +1176,10 @@ post '/instances/:inst/restore/*backupfile' => sub {
                             die "postmap rc=$pm_rc: $pm_out" if $pm_rc != 0;
                             return 1;
                         });
+                    })->catch(sub {
+                        my ($err) = @_;
+                        $result{postmap} = { executed => 1, result => 'fail', error => "$err" };
+                        return 1;
                     });
                 } else {
                     $result{postmap} = { executed => 0 };
@@ -1235,8 +1202,12 @@ post '/instances/:inst/restore/*backupfile' => sub {
                                     $result{reload}{result}  = 'warn';
                                     $result{reload}{warning} = "reload rc=$reload_rc (will verify via status)";
                                 }
-return 1;
+                                return 1;
                             });
+                        })->catch(sub {
+                            my ($err) = @_;
+                            $result{reload} = { executed => 1, result => 'fail', error => "$err" };
+                            return 1;
                         });
                     } else {
                         $result{reload} = { executed => 0 };
@@ -1264,11 +1235,15 @@ return 1;
 
                                     return 1 if $st eq 'running';
 
-                                    # Toleranz wie frueher: rc==0 aber Output nicht eindeutig -> nicht hart failen
+                                    # Toleranz wie früher: rc==0 aber Output nicht eindeutig -> nicht hart failen
                                     return 1 if $st eq 'unknown-ok';
 
                                     die "Status not running (rc=$status_rc): $status_out";
                             });
+                        })->catch(sub {
+                            my ($err) = @_;
+                            $result{status} = { executed => 1, result => 'fail', error => "$err" };
+                            return 1;
                         });
                     } else {
                         $result{status} = { executed => 0 };
