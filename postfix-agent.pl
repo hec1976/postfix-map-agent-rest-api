@@ -18,7 +18,16 @@ use File::Spec;
 
 use constant RELOAD_GRACE_S  => 0.35;
 use constant LOCK_TIMEOUT_S  => 3.0;
-our $VERSION = '1.5.9';
+
+sub _num_seconds {
+    my ($v, $default) = @_;
+    return $default unless defined $v;
+    # akzeptiert 0.35, 1, "2.0"
+    return $v + 0 if $v =~ /\A\d+(?:\.\d+)?\z/;
+    return $default;
+}
+
+our $VERSION = '1.6.0';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -800,7 +809,8 @@ sub _status_verify_p {
 
     my $p = Mojo::Promise->resolve;
 
-    my $grace = RELOAD_GRACE_S();
+    # kleiner Grace bevor wir den Status abfragen (Systemd/Postfix braucht manchmal einen Tick)
+    my $grace = _num_seconds($config->{global}{reload_grace_s}, RELOAD_GRACE_S());
     $p = $p->then(sub {
         my $t = Mojo::Promise->new;
         Mojo::IOLoop->timer($grace => sub { $t->resolve(1) });
@@ -831,15 +841,22 @@ sub _status_verify_p {
             my $st = parse_service_status($status_out, $status_rc);
             $result->{status}{result} = $st;
 
+            # Wichtig: Status-Checks sollen NIE die ganze Operation killen.
+            # Wir liefern Warnungen, aber kein rejected Promise.
             return 1 if $st eq 'running';
-            return 1 if $st eq 'unknown-ok';
 
-            if (defined $status_rc && $status_rc == 0) {
-                $result->{status}{warning} = 'Status nicht eindeutig, rc=0 (toleriert)';
+            if ($st eq 'unknown-ok') {
+                $result->{status}{warning} = 'Status nicht eindeutig (toleriert)';
                 return 1;
             }
 
-            die "Status not running (rc=$status_rc): $status_out";
+            if (defined $status_rc && $status_rc == 0) {
+                $result->{status}{warning} = 'Status meldet nicht running, aber rc=0 (toleriert)';
+                return 1;
+            }
+
+            $result->{status}{warning} = "Status meldet '$st' (rc=$status_rc)";
+            return 1;
         });
     })->catch(sub {
         my ($err) = @_;
