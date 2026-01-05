@@ -1,17 +1,16 @@
 # Postfix Map Agent - REST
-# Version: 1.5.2 (2026-01-05, Mojo-only, async subprocess)
+# Version: 1.5.3 (2026-01-05, Mojo-only, async subprocess)
 #
 # Fixes ggü. 1.5.1:
-# - Single-Instanz wieder kompatibel: configs.json im alten Flat-Format wird intern automatisch zu instances.default gewrappt
-# - reload_config macht das gleiche Wrapping wie beim Start, damit Single nach einem Reload nicht wieder kaputt geht
-# - _rebuild_cfgmap_from nutzt ebenfalls das Wrapping, damit delmap und Config-Updates bei Single stabil bleiben
-# - Instanzname wird konsistent normalisiert (leer oder undef wird zu default), damit Lockdir und Instanzzugriff nie auf "" laufen
-# - delmap normalisiert inst ebenfalls, damit deregistrieren bei Single und Multi gleich funktioniert
-# - Lesefehler-Ausgaben robuster: read_raw/read_text melden jetzt $@ oder $! (Mojo File Fehler landen oft in $@)
-#
+# - Instanz-Aufloesung wieder wie frueher: wenn genau 1 Instanz existiert, wird sie automatisch verwendet
+# - "default" wird bei Single als Alias akzeptiert, falls keine echte default Instanz existiert
+# - reload_config und _rebuild_cfgmap_from halten die Instanz-Map konsistent (kein Single-Break nach Reload/Write)
+# - Locks/FS arbeiten immer mit dem effektiv aufgeloesten Instanznamen
+# - Lesefehler-Ausgaben robuster: read_raw/read_text melden $@ oder $! (Mojo File Fehler landen oft in $@)
+
 # Verhalten:
-# - Logik bleibt analog zu 1.3.3: gleiche API Semantik, gleiche Map/Backup/Reload Ablaufe
-# - Multi-Instanz Verhalten bleibt unveraendert, Single ist nur Rueckwaerts-Kompatibilitaet
+# - Logik analog zu 1.3.x: Single ohne "default"-Key funktioniert wieder wie gewohnt, Multi verlangt eine eindeutige Instanz
+# - Multi-Instanz Verhalten bleibt unveraendert
 # Version: 1.5.1 (2026-01-04, Mojo-only, async subprocess)
 #
 # Änderungen ggü. 1.3.3:
@@ -65,7 +64,7 @@ use Text::ParseWords qw(shellwords);
 
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
-our $VERSION = '1.5.2';
+our $VERSION = '1.5.3';
 
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
@@ -372,7 +371,49 @@ sub normalize_inst {
     my ($inst) = @_;
     $inst = '' unless defined $inst;
     $inst =~ s/^\s+|\s+$//g;
-    return length($inst) ? $inst : 'default';
+    return $inst;
+}
+
+# Instanz-Aufloesung analog zur alten Logik:
+# - Wenn Instanz angegeben: verwenden (Unknown -> spaeter 404)
+# - Wenn Instanz fehlt oder "default" ist und es genau 1 Instanz gibt: diese eine nehmen
+# - Wenn Instanz fehlt und mehrere existieren: Fehler (Instance required)
+sub resolve_inst_name {
+    my ($inst_in) = @_;
+    my $inst = normalize_inst($inst_in);
+
+    my @names = sort keys %{ $config->{instances} // {} };
+
+    # kein inst angegeben
+    if ($inst eq '') {
+        return $names[0] if @names == 1;
+        return '';
+    }
+
+    # "default" als bequemer Alias, aber nur wenn genau eine Instanz existiert
+    if ($inst eq 'default' && !exists $config->{instances}{default} && @names == 1) {
+        return $names[0];
+    }
+
+    return $inst;
+}
+
+sub get_instance_or_render {
+    my ($c, $inst_in) = @_;
+    my $inst = resolve_inst_name($inst_in);
+
+    if (!defined $inst || $inst eq '') {
+        $c->render(status => 400, json => { ok => 0, error => 'Instance required' });
+        return;
+    }
+
+    my $ci = $config->{instances}{$inst};
+    unless ($ci) {
+        $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' });
+        return;
+    }
+
+    return ($inst, $ci);
 }
 
 sub _looks_like_instance_node {
@@ -759,9 +800,8 @@ get '/instances' => sub {
 get '/instances/:inst/maps' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst}
-            or return $c->render(status => 404, json => { ok => 0, error => 'Unknown' });
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my %seen;
         my $globs = $ci->{globs} // {};
         my $want_all = ($c->param('all') // '') eq '1';
@@ -792,8 +832,8 @@ get '/instances/:inst/maps' => sub {
 get '/instances/:inst/map/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst} or return $c->render(status => 404, json => { ok => 0, error => 'Unknown' });
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my ($map, $err) = sanitize_map_name($c->stash('map'));
         return $c->render(status=>400, json=>{ ok=>0, error=>$err }) if $err;
         return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
@@ -810,8 +850,8 @@ get '/instances/:inst/map/*map' => sub {
 get '/instances/:inst/backup/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst} or return $c->render(status => 404, json => { ok => 0, error => 'Unknown' });
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my ($base, $err) = sanitize_map_name($c->stash('map'));
         return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
         return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
@@ -829,8 +869,8 @@ get '/instances/:inst/backup/*map' => sub {
 get '/instances/:inst/backupfile/*backup' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst} or return $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' });
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my ($backup_file, $err) = sanitize_map_name($c->stash('backup') // '');
         return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
         my $backup_dir  = effective_backup_dir($ci, $inst);
@@ -859,8 +899,8 @@ get '/instances/:inst/backupfile/*backup' => sub {
 post '/instances/:inst/map/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst};
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my %result = (
             ok => 1, error => '', changed => 0,
             backup => 'skipped', write => 'skipped',
@@ -1074,9 +1114,8 @@ post '/instances/:inst/map/*map' => sub {
 post '/instances/:inst/restore/*backupfile' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
-        my $ci   = $config->{instances}{$inst};
-        return $c->render(status => 404, json => { ok => 0, error => 'Unknown instance' }) unless $ci;
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my ($backupfile, $err) = sanitize_map_name($c->stash('backupfile') // '');
         return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
         my $backup_dir = effective_backup_dir($ci, $inst);
@@ -1211,7 +1250,8 @@ post '/instances/:inst/restore/*backupfile' => sub {
 post '/instances/:inst/delmap/*map' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = normalize_inst($c->stash('inst'));
+        my ($inst, $ci) = get_instance_or_render($c, $c->stash('inst'));
+        return unless $ci;
         my ($map, $err) = sanitize_map_name($c->stash('map'));
         return $c->render(status => 400, json => { ok => 0, error => $err }) if $err;
         return $c->render(status=>400, json=>{ ok=>0, error=>'forbidden map name' })
@@ -1315,7 +1355,8 @@ post '/instances/:inst/delmap/*map' => sub {
 get '/instances/:inst/globs' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
+        my $inst = resolve_inst_name($c->stash('inst'));
+        return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
         my $cfg  = eval { _read_cfg_hash() };
         return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
         my $node = _inst_node_rw($cfg, $inst);
@@ -1328,7 +1369,8 @@ get '/instances/:inst/globs' => sub {
 post '/instances/:inst/globs' => sub {
     my $c = shift;
     return run_promise($c, sub {
-        my $inst = $c->stash('inst');
+        my $inst = resolve_inst_name($c->stash('inst'));
+        return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
         my $j = eval { $c->req->json }; $j = {} if $@ || !defined $j;
         my @items;
         if (ref($j) eq 'HASH' && %$j) {
@@ -1387,7 +1429,8 @@ post '/instances/:inst/globs' => sub {
 # ======== API: globs delete (einzelner Key) ==================================
 del '/instances/:inst/globs/:map' => sub {
     my $c    = shift;
-    my $inst = $c->stash('inst');
+    my $inst = resolve_inst_name($c->stash('inst'));
+    return $c->render(status=>400, json=>{ok=>0,error=>'Instance required'}) unless $inst;
     my $map  = $c->stash('map');
     my $cfg  = eval { _read_cfg_hash() };
     return $c->render(status=>500, json=>{ok=>0,error=>"configs.json lesen: $@"}) if $@;
