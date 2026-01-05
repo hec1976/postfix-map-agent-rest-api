@@ -1,20 +1,23 @@
 {
-  "postfix": {
-    "backup_dir": "\/opt\/mmbb_services\/postfix-agent\/backup\/postfix",
-    "config_dir": "\/etc\/postfix",
-    "globs": {
-      "transport": "lmdb",
-      "header_checks": "regexp"
-    },
-    "map_dir": "\/etc\/postfix",
-    "max_backups": 50,
+  "default": {
+    "map_dir": "t/tmp/maps",
+    "config_dir": "t/tmp/postfix",
+    "backup_dir": "t/tmp/backups/default",
+    "max_backups": 5,
+    "reload_on_change": true,
+    "reload_cmd": "systemctl reload postfix",
+    "status_cmd": "systemctl is-active postfix",
     "postmap_by_type": {
       "lmdb": "\/usr\/sbin\/postmap -c {config_dir} {path}",
+      "hash": "\/usr\/sbin\/postmap -c {config_dir} {path}",
+      "btree": "\/usr\/sbin\/postmap -c {config_dir} {path}",
+      "regexp": "",
       "pcre": "",
-      "regexp": ""
+      "cidr": ""
     },
-    "reload_cmd": "systemctl reload postfix",
-    "reload_on_change": true,
-    "status_cmd": "systemctl is-active postfix"
+    "globs": {
+      "virtual": "lmdb",
+      "abc.pcre": "pcre"
+    }
   }
 }
