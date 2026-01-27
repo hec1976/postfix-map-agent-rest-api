@@ -1,12 +1,13 @@
 #!/usr/bin/env perl
 use strict;
 use warnings;
-
+use utf8;
 use Mojolicious::Lite;
 use Mojo::Log;
 use Mojo::File qw(path);
 use Mojo::JSON qw(decode_json to_json true false);
-use Mojo::Util qw(url_escape secure_compare decode);
+use Mojo::Util qw(url_escape secure_compare);
+use Encode qw(decode);
 use Mojo::Promise;
 use Mojo::IOLoop;
 use Mojo::IOLoop::Subprocess;
@@ -20,7 +21,7 @@ use File::Spec;
 use constant RELOAD_GRACE_S => 0.35;
 use constant LOCK_TIMEOUT_S => 3.0;
 
-our $VERSION = '1.6.6';
+our $VERSION = '1.6.8';
 
 umask 0007;
 
@@ -393,15 +394,20 @@ sub backup_file {
     my ($file, $dir, $max) = @_;
     return unless -f $file;
 
-    my $e = ensure_dir(dir=>$dir, user=>$global->{serviceUser}, group=>$global->{serviceGroup}, mode=>$global->{dirs}{service_mode});
+    my $e = ensure_dir(
+        dir  => $dir,
+        user => $global->{serviceUser},
+        group=> $global->{serviceGroup},
+        mode => $global->{dirs}{service_mode}
+    );
     $logger->warn($e) if $e;
 
     my $dst = "$dir/" . path($file)->basename . ".bak." . _ts_compact();
+
     try {
-        path($dst)->spew(path($file)->slurp);
-        my $bm = effective_backup_mode();
-        my $er = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bm);
-        $logger->warn($er) if $er;
+        # Einheitlich: Backup ist UTF-8 Text, geschrieben ueber atomic_write (ein Weg, ein Encoding)
+        my $txt = read_text($file);
+        atomic_write($dst, $txt, $global->{serviceUser}, $global->{serviceGroup}, effective_backup_mode());
     } catch {
         $logger->error("Backup fehlgeschlagen: $_");
         return;
@@ -410,7 +416,9 @@ sub backup_file {
     return unless $max;
     my @bak = sort { (stat($a))[9] <=> (stat($b))[9] } glob("$dir/" . path($file)->basename . ".bak.*");
     my $to_delete = @bak - $max;
-    for my $del (@bak[0 .. $to_delete-1]) { unlink $del or $logger->warn("Konnte altes Backup nicht loeschen: $del ($!)") }
+    for my $del (@bak[0 .. $to_delete-1]) {
+        unlink $del or $logger->warn("Konnte altes Backup nicht loeschen: $del ($!)");
+    }
 }
 
 # -------------------- Promise wrapper + subprocess --------------------
@@ -423,6 +431,7 @@ sub run_promise {
         $c->render(status => 500, json => { ok => 0, error => 'Internal error' });
     });
 }
+
 
 sub run_cmd_subprocess_p {
     my ($cmd_str) = @_;
@@ -439,10 +448,19 @@ sub run_cmd_subprocess_p {
         sub {
             open(local *STDERR, ">&", STDOUT) or die "Can't dup STDOUT: $!";
             open(my $fh, "-|", @cmd) or die "Can't execute @cmd: $!";
-            my $output = do { local $/; <$fh> };
+            my $output = do { local $/; <$fh> } // '';
             close($fh);
             my $rc = $? >> 8;
-            return { rc => $rc, output => $output // '' };
+
+            # Tolerant UTF-8 decode fuer Logs/Regex/lc()
+            if (!utf8::is_utf8($output)) {
+                eval { $output = decode('UTF-8', $output, 1); 1 } or do {
+                    # Wenn es kein UTF-8 ist, lassen wir es als Bytes-String stehen
+                    # (besser als crashen)
+                };
+            }
+
+            return { rc => $rc, output => $output };
         },
         sub {
             my ($subproc, $err, $res) = @_;
@@ -451,7 +469,7 @@ sub run_cmd_subprocess_p {
         }
     );
 
-    $p;
+    return $p;
 }
 
 sub run_cmd_into_result_p {
@@ -738,9 +756,20 @@ sub h_save_map {
         else                                                  { $new_content = to_json($json, { canonical => 1 }) }
     }
 
-    $new_content //= $c->param('content');
-    $new_content //= decode('UTF-8', $c->req->body // '');
-    $new_content =~ s/\r\n/\n/g if defined $new_content;
+	$new_content //= $c->param('content');
+
+	my $raw_body = $c->req->body // '';
+	if (!utf8::is_utf8($raw_body)) {
+		my $ok = eval { $raw_body = decode('UTF-8', $raw_body, 1); 1 }; # FB_CROAK
+		if (!$ok) {
+			$result{ok} = 0;
+			$result{error} = 'Ungueltiges UTF-8 im Request-Body';
+			return $c->render(status => 400, json => \%result);
+		}
+	}
+	$new_content //= $raw_body;
+
+	$new_content =~ s/\r\n/\n/g if defined $new_content;
 
     my $dir = path($path)->dirname->to_string;
     if (!-d $dir) {
@@ -818,7 +847,7 @@ sub h_restore_backup {
         apply_map_change_p(
             ci=>$ci, inst=>$inst, map=>$map, result=>\%result,
             writecb => sub {
-                atomic_write($dst, path($src)->slurp, $global->{serviceUser}, $global->{serviceGroup}, $global->{fileMode_service});
+                atomic_write($dst, read_text($src), $global->{serviceUser}, $global->{serviceGroup}, $global->{fileMode_service});
             }
         );
     };
