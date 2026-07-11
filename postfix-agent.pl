@@ -1,6 +1,18 @@
 #!/usr/bin/env perl
 # Postfix Map Agent - REST
-# Version: 1.4.3-hardened-compatible (2026-07-11)
+# Version: 1.4.10-hardened-compatible (2026-07-11)
+#
+# Änderungen ggü. 1.4.9:
+# - Dateilog wird pro Logeintrag mit O_APPEND|O_CREAT geöffnet und wieder geschlossen.
+#   Wird die Logdatei während des Betriebs gelöscht oder rotiert, wird sie beim
+#   nächsten Logeintrag automatisch neu erstellt bzw. der neue Pfad verwendet.
+# - Dateilogzeilen werden vor dem Schreiben explizit genau einmal als UTF-8 kodiert.
+# - Symlinks werden beim Öffnen mit O_NOFOLLOW (falls verfügbar) abgelehnt.
+# - Der globale __DIE__-Handler ist nur während der Startphase aktiv; nach dem
+#   erfolgreichen Logger-Wechsel gilt wieder Perls Standardverhalten. Fehler in
+#   Mojolicious-Request-Handlern beenden damit nicht versehentlich den Daemon.
+# - DELETE /instances/:inst/globs/:map und der globale backupDir-Fallback bleiben
+#   wie in 1.4.9 konsistent:wq validiert.
 #
 # Security-/Robustheits-Hardening gegenüber 1.3.3:
 # - Voll rückwärtskompatibel zu bestehender global.json/configs.json (keine Pflichtänderung)
@@ -12,6 +24,13 @@
 # - Konstante Token-Prüfung, CORS-Allowlist und sicherer HTTP-Guard
 # - UTF-8 JSON-Verarbeitung korrigiert; Config-Schreibzugriffe serialisiert
 # - Symlink-Schutz und konsequente Prüfung von chmod/chown
+#
+# Änderungen ggü. 1.4.3:
+# - Log::Log4perl vollständig entfernt; Logging erfolgt nativ über Mojo::Log.
+# - Startup- und Hauptlog verwenden dasselbe UTF-8-Format.
+# - Mojolicious-interne Meldungen werden in das konfigurierte Hauptlog geschrieben.
+# - Optional: log_level und fileMode_log in global.json; Defaults info und 0660.
+# - Keine Änderungen an REST-Endpunkten, Maps, postmap, Reload, Restore oder PID-Verhalten.
 #
 # Änderungen ggü. 1.3.2:
 # - Per-Map flock: Instanz in Lock-Pfad einbezogen (Bugfix: $inst an with_map_lock übergeben)
@@ -25,7 +44,7 @@
 # - API_TOKEN Pflicht: Start bricht ab, wenn weder ENV(API_TOKEN) noch global.json(api_token) gesetzt
 # - Backup-Rotation nach mtime statt Stringsortierung (stabil bei untypischen Dateinamen)
 # - atomic_write_umask robuster: mehr Versuche, sauberes Logging, Fallback auf File::Temp falls O_EXCL scheitert
-# - Konsistentes Logging (Log4perl) statt warn
+# - Konsistentes Logging über Mojolicious/Mojo::Log statt zusätzlicher Log4perl-Abhängigkeit
 # - Statuserkennung erweitert (/(?:is\s+running|^active|^running)/)
 # - Löschen aus globs nur bei EXAKTEM Key-Match (Patterns bleiben unangetastet)
 # - Kleines Cleanup: chmod/chown nur, wenn Parameter wirklich gesetzt (kein sprintf auf undef)
@@ -46,8 +65,10 @@ use strict;
 use warnings;
 use utf8;
 
-binmode STDOUT, ':encoding(UTF-8)';
-binmode STDERR, ':encoding(UTF-8)';
+# Die Standard-Handles bleiben binär. Journalmeldungen werden ASCII-sicher
+# formatiert; Dateilogzeilen werden im eigenen Writer explizit als UTF-8 kodiert.
+binmode STDOUT, ':raw';
+binmode STDERR, ':raw';
 
 use Mojolicious::Lite;
 use JSON::MaybeXS;
@@ -55,19 +76,21 @@ use File::Basename qw(basename dirname);
 use File::Copy qw(copy);
 use POSIX qw(strftime setpgid);
 use FindBin qw($Bin);
-use Log::Log4perl qw(:easy);
+use Mojo::Log;
 use Try::Tiny;
 use File::Temp qw(tempfile);
 use File::Path qw(make_path);
 use File::Spec;
-use Encode qw(decode_utf8);
+use Encode qw(decode decode_utf8 encode FB_CROAK);
 use Net::CIDR;
 use Mojo::Util qw(url_escape);
 use Mojo::JSON qw(true false);
-use Fcntl qw(:mode O_CREAT O_EXCL O_WRONLY O_RDWR :flock);
+use Fcntl qw(:mode O_CREAT O_EXCL O_WRONLY O_RDWR O_APPEND :flock);
+use Errno qw(EEXIST ENOENT);
 use Time::HiRes qw(time sleep);
 use IPC::Open3 qw(open3);
 use IO::Select;
+use IO::Handle ();
 use Symbol qw(gensym);
 
 
@@ -77,61 +100,261 @@ use constant STATUS_TIMEOUT_S     => 5.0;
 use constant STATUS_POLL_S        => 0.25;
 use constant MAX_COMMAND_OUTPUT_B => 1_048_576;
 
-our $VERSION = '1.4.3-hardened-compatible';
+our $VERSION = '1.4.10-hardened-compatible';
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
 
-# Logger wird zweistufig initialisiert:
-# - vor global.json/Log4perl in ein festes Bootstrap-Log
-# - danach zusätzlich in das konfigurierte Hauptlog
-my $BOOTSTRAP_LOG = '/var/log/mmbb/postfix-agent-startup.log';
+# Der Startlogger schreibt ausschließlich nach STDERR/journald. Erst nach dem
+# erfolgreichen Lesen und Validieren der gesamten Konfiguration wird auf den
+# in global.json angegebenen Dateilogpfad umgeschaltet.
 my $logger;
-my $logger_ready = 0;
+my $journal_logger;
 my $in_die_handler = 0;
+my $startup_die_handler_active = 1;
+my $runtime_log_error_guard = 0;
+my $o_nofollow = eval { Fcntl::O_NOFOLLOW() } || 0;
+
+sub _as_text {
+  my ($value) = @_;
+  return '' unless defined $value;
+  return $value if utf8::is_utf8($value);
+
+  # Externe Kommandos liefern Bytes. Gültiges UTF-8 wird dekodiert; nur bei
+  # wirklich ungültigen Bytefolgen erfolgt ein verlustfreier Latin-1-Fallback.
+  my $copy = "$value";
+  my $decoded = eval { decode('UTF-8', $copy, FB_CROAK) };
+  return $decoded if defined $decoded;
+  return decode('ISO-8859-1', "$value");
+}
 
 sub _single_line {
   my ($msg) = @_;
-  $msg //= '';
+  $msg = _as_text($msg);
   $msg =~ s/[\r\n]+/ | /g;
   $msg =~ s/^\s+|\s+$//g;
   return $msg;
 }
 
-sub _bootstrap_log {
-  my ($level, $msg) = @_;
-  $level //= 'ERROR';
-  $msg = _single_line($msg);
-  my $line = strftime('%Y/%m/%d %H:%M:%S', localtime) . " $level $msg\n";
-
-  eval {
-    my $dir = dirname($BOOTSTRAP_LOG);
-    make_path($dir) unless -d $dir;
-    open my $fh, '>>:encoding(UTF-8)', $BOOTSTRAP_LOG or return;
-    print {$fh} $line;
-    close $fh;
-    1;
-  };
+sub _mojo_log_format {
+  my ($time, $level, @lines) = @_;
+  my $timestamp = strftime('%Y/%m/%d %H:%M:%S', localtime($time));
+  my $message = _single_line(join(' ', map { _as_text($_) } @lines));
+  return sprintf("%s %s %s\n", $timestamp, uc($level // 'INFO'), $message);
 }
+
+sub _journal_ascii {
+  my ($msg) = @_;
+  $msg = _as_text($msg);
+  $msg =~ s/Ä/Ae/g;
+  $msg =~ s/Ö/Oe/g;
+  $msg =~ s/Ü/Ue/g;
+  $msg =~ s/ä/ae/g;
+  $msg =~ s/ö/oe/g;
+  $msg =~ s/ü/ue/g;
+  $msg =~ s/ß/ss/g;
+  $msg =~ s/é/e/g;
+  $msg =~ s/è/e/g;
+  $msg =~ s/à/a/g;
+  $msg =~ s/[^\x09\x20-\x7e]/?/g;
+  return $msg;
+}
+
+sub _mojo_journal_format {
+  my ($time, $level, @lines) = @_;
+  my $timestamp = strftime('%Y/%m/%d %H:%M:%S', localtime($time));
+  my $message = _single_line(join(' ', map { _as_text($_) } @lines));
+  $message = _journal_ascii($message);
+  return sprintf("%s %s %s\n", $timestamp, uc($level // 'INFO'), $message);
+}
+
+sub _normalized_log_level {
+  my ($level) = @_;
+  $level = lc($level // 'info');
+  return $level =~ /\A(?:trace|debug|info|warn|error|fatal)\z/ ? $level : 'info';
+}
+
+sub _new_stderr_logger {
+  my ($level) = @_;
+  my $log = Mojo::Log->new(
+    handle => \*STDERR,
+    level  => _normalized_log_level($level),
+    color  => 0,
+    short  => 0,
+  );
+  $log->format(\&_mojo_journal_format);
+  return $log;
+}
+
+sub _validate_log_path {
+  my ($path) = @_;
+  die "global.json: logfile fehlt"
+    unless defined($path) && length($path);
+  die "global.json: ungültiger logfile-Pfad"
+    if $path =~ /[\x00\r\n]/ || !File::Spec->file_name_is_absolute($path);
+  return 1;
+}
+
+sub _ensure_log_directory {
+  my ($path) = @_;
+  my $dir = dirname($path);
+  make_path($dir) unless -d $dir;
+  die "Kann Log-Verzeichnis $dir nicht anlegen" unless -d $dir;
+  return $dir;
+}
+
+sub _open_log_append {
+  my ($path, $mode, $user, $group) = @_;
+  my $flags = O_WRONLY | O_APPEND | $o_nofollow;
+
+  for (1 .. 4) {
+    die "Logdatei ist ein Symlink und wird abgelehnt: $path"
+      if !$o_nofollow && -l $path;
+
+    my ($fh, $created) = (undef, 0);
+    if (sysopen($fh, $path, $flags | O_CREAT | O_EXCL, $mode)) {
+      $created = 1;
+    } elsif ($! == EEXIST) {
+      if (!sysopen($fh, $path, $flags, $mode)) {
+        next if $! == ENOENT;
+        die "Kann Logdatei $path nicht öffnen: $!";
+      }
+    } else {
+      die "Kann Logdatei $path nicht öffnen: $!";
+    }
+
+    binmode($fh, ':raw') or do {
+      my $err = $!;
+      close $fh;
+      die "binmode($path) fehlgeschlagen: $err";
+    };
+
+    if ($created) {
+      my $perm_err = set_file_ownership_and_mode(
+        $path, $user, $group, sprintf('%04o', $mode)
+      );
+      if ($perm_err) {
+        close $fh;
+        die "Logfile-Rechte konnten nicht gesetzt werden: $perm_err";
+      }
+    }
+
+    return ($fh, $created);
+  }
+
+  die "Kann Logdatei $path wegen gleichzeitiger Rotation/Löschung nicht stabil öffnen";
+}
+
+sub _write_utf8_log_line {
+  my ($path, $mode, $user, $group, $line) = @_;
+  my $bytes = encode('UTF-8', _as_text($line), FB_CROAK);
+
+  for (1 .. 4) {
+    my ($fh) = _open_log_append($path, $mode, $user, $group);
+    flock($fh, LOCK_EX) or do {
+      my $err = $!;
+      close $fh;
+      die "Kann Logdatei $path nicht sperren: $err";
+    };
+
+    my @fh_stat   = stat($fh);
+    my @path_stat = stat($path);
+    if (!@path_stat || !@fh_stat
+        || $fh_stat[0] != $path_stat[0]
+        || $fh_stat[1] != $path_stat[1]) {
+      flock($fh, LOCK_UN);
+      close $fh;
+      next;
+    }
+
+    my $offset = 0;
+    my $length = length($bytes);
+    while ($offset < $length) {
+      my $written = syswrite($fh, $bytes, $length - $offset, $offset);
+      if (!defined $written) {
+        my $err = $!;
+        flock($fh, LOCK_UN);
+        close $fh;
+        die "Kann Logdatei $path nicht schreiben: $err";
+      }
+      $offset += $written;
+    }
+
+    flock($fh, LOCK_UN);
+    close $fh or die "Kann Logdatei $path nicht schließen: $!";
+    return 1;
+  }
+
+  die "Kann Logdatei $path nach Rotation/Löschung nicht schreiben";
+}
+
+sub _direct_journal_error {
+  my ($message) = @_;
+  return if $runtime_log_error_guard;
+  $runtime_log_error_guard = 1;
+  my $line = _mojo_journal_format(time, 'error', $message);
+  syswrite(STDERR, $line);
+  $runtime_log_error_guard = 0;
+}
+
+sub _prepare_configured_log {
+  my ($path, $mode, $user, $group) = @_;
+  _validate_log_path($path);
+  _ensure_log_directory($path);
+
+  my ($fh) = _open_log_append($path, $mode, $user, $group);
+  my $perm_err = set_file_ownership_and_mode(
+    $path, $user, $group, sprintf('%04o', $mode)
+  );
+  close $fh;
+  die "Logfile-Rechte konnten nicht gesetzt werden: $perm_err" if $perm_err;
+  return 1;
+}
+
+sub _new_file_logger {
+  my ($path, $mode, $user, $group, $level) = @_;
+  my $log = Mojo::Log->new(
+    level => _normalized_log_level($level),
+    color => 0,
+    short => 0,
+  );
+
+  $log->unsubscribe('message');
+  $log->on(message => sub {
+    my ($log_obj, $msg_level, @lines) = @_;
+    my $line = _mojo_log_format(time, $msg_level, @lines);
+    my $ok = eval {
+      _write_utf8_log_line($path, $mode, $user, $group, $line);
+      1;
+    };
+    unless ($ok) {
+      my $error = _single_line($@ || 'unbekannter Dateilog-Fehler');
+      _direct_journal_error("MAIN LOG WRITE FAILED: path=$path error=$error");
+    }
+  });
+
+  return $log;
+}
+
+$journal_logger = _new_stderr_logger('info');
+$logger = $journal_logger;
+app->log($logger);
+$logger->info("STARTUP BEGIN: version=$VERSION");
 
 sub _log_fatal {
   my ($msg) = @_;
   $msg = _single_line($msg);
-  if ($logger_ready && $logger) {
-    eval { $logger->error("FATAL: $msg") };
-  }
-  _bootstrap_log('ERROR', "FATAL: $msg");
+  eval { $logger->fatal($msg) } if $logger;
 }
 
-# Unbehandelte Startfehler werden immer protokolliert. Fehler innerhalb eines
-# eval-Blocks werden am jeweiligen Aufrufer gezielt geloggt, damit es keine
-# irreführenden Doppelmeldungen gibt.
 $SIG{__DIE__} = sub {
   my ($msg) = @_;
+  return if !$startup_die_handler_active;
   return if $^S;
   return if $in_die_handler;
   $in_die_handler = 1;
   _log_fatal($msg);
   $in_die_handler = 0;
+  exit 255;
 };
 
 # -------------------- I/O Basis-Helfer --------------------
@@ -218,8 +441,11 @@ my $instances_cfg_file = "$Bin/configs.json";
 die "Missing config $global_cfg_file\n"    unless -f $global_cfg_file;
 die "Missing config $instances_cfg_file\n" unless -f $instances_cfg_file;
 
+$logger->info("CONFIG READ START: global=$global_cfg_file instances=$instances_cfg_file");
 my $global         = read_json_config($global_cfg_file);
+$logger->info("CONFIG READ OK: file=$global_cfg_file");
 my $instances_raw  = read_json_config($instances_cfg_file);
+$logger->info("CONFIG READ OK: file=$instances_cfg_file");
 my $instances      = (ref($instances_raw->{instances}) eq 'HASH')
                      ? $instances_raw->{instances}
                      : $instances_raw;
@@ -238,31 +464,17 @@ if (!defined($mojo_secret) || length($mojo_secret) < 32) {
 app->secrets([$mojo_secret]);
 app->max_request_size(2 * 1024 * 1024);
 
-# -------------------- Logging vorbereiten --------------------
+# -------------------- Logging-Konfiguration vorbereiten --------------------
 
-my $logfile = $global->{logfile} // "/var/log/mmbb/postfix-agent.log";
-die "Ungültiger Log-Pfad" if $logfile =~ /[\x00\r\n]/ || !File::Spec->file_name_is_absolute($logfile);
-my $logdir  = dirname($logfile);
-unless (-d $logdir) {
-  eval { make_path($logdir) };
-  die "Kann Log-Verzeichnis $logdir nicht anlegen: $@" if $@;
-}
-my $log_conf = qq(
-log4perl.rootLogger                   = INFO, LOGFILE
-log4perl.appender.LOGFILE             = Log::Log4perl::Appender::File
-log4perl.appender.LOGFILE.filename    = $logfile
-log4perl.appender.LOGFILE.mode        = append
-log4perl.appender.LOGFILE.utf8        = 1
-log4perl.appender.LOGFILE.layout      = Log::Log4perl::Layout::PatternLayout
-log4perl.appender.LOGFILE.layout.ConversionPattern = %d %p %m%n
-);
-eval { Log::Log4perl->init(\$log_conf) } or die "Log4perl-Init fehlgeschlagen ($logfile): $@";
-$logger = Log::Log4perl->get_logger();
-$logger_ready = 1;
+# Kein hart codierter Hauptlogpfad: logfile muss aus global.json kommen.
+my $logfile = $global->{logfile};
+my $log_mode = _normalize_mode($global->{fileMode_log} // '0660');
+$log_mode = 0660 unless defined $log_mode;
 
-# Logfile-Owner/Group nachziehen (Modus via umask/UMask)
-my $log_perm_err = set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup});
-$logger->warn("Logfile-Rechte konnten nicht vollständig gesetzt werden: $log_perm_err") if $log_perm_err;
+my $requested_log_level = lc($global->{log_level} // 'info');
+my $effective_log_level = _normalized_log_level($requested_log_level);
+
+# Bis zum erfolgreichen Abschluss der Startprüfung bleibt $logger auf journald.
 
 # -------------------- FS-Rechte & Ownership --------------------
 
@@ -503,6 +715,13 @@ sub _cors_origin_allowed {
   return 1 unless exists $config->{global}{allowed_origins};
   return 0 unless ref($allowed) eq 'ARRAY';
   return scalar grep { defined($_) && $_ eq $origin } @$allowed;
+}
+
+if (!exists $config->{global}{allowed_origins}) {
+  $logger->warn(
+    "CORS COMPATIBILITY MODE: allowed_origins fehlt; jede Origin wird gespiegelt. "
+    . "Produktiv allowed_origins explizit setzen."
+  );
 }
 
 hook before_dispatch => sub {
@@ -911,11 +1130,20 @@ sub validate_config {
     my $ci = $insts->{$inst};
     die "Instanz '$inst' muss ein Objekt sein" unless ref($ci) eq 'HASH';
     die "Instanz '$inst': ungültiger Instanzname" unless $inst =~ /\A[0-9A-Za-z._-]+\z/;
-    for my $key (qw(config_dir map_dir backup_dir)) {
+    for my $key (qw(config_dir map_dir)) {
       die "Instanz '$inst': $key fehlt" unless defined($ci->{$key}) && length($ci->{$key});
       die "Instanz '$inst': $key enthält Steuerzeichen" if $ci->{$key} =~ /[\x00\r\n]/;
       die "Instanz '$inst': $key muss absolut sein ($ci->{$key})" unless File::Spec->file_name_is_absolute($ci->{$key});
     }
+
+    my $effective_bdir = effective_backup_dir($ci, $inst);
+    die "Instanz '$inst': weder backup_dir noch globales backupDir konfiguriert"
+      unless defined($effective_bdir) && length($effective_bdir);
+    die "Instanz '$inst': Backup-Pfad enthält Steuerzeichen"
+      if $effective_bdir =~ /[\x00\r\n]/;
+    die "Instanz '$inst': Backup-Pfad muss absolut sein ($effective_bdir)"
+      unless File::Spec->file_name_is_absolute($effective_bdir);
+
     die "Instanz '$inst': config_dir nicht vorhanden: $ci->{config_dir}" unless -d $ci->{config_dir};
     die "Instanz '$inst': main.cf nicht lesbar: $ci->{config_dir}/main.cf" unless -r File::Spec->catfile($ci->{config_dir}, 'main.cf');
     die "Instanz '$inst': map_dir nicht vorhanden: $ci->{map_dir}" unless -d $ci->{map_dir};
@@ -971,6 +1199,50 @@ sub validate_config {
 $logger->info("CONFIG VALIDATION START: global=$global_cfg_file instances=$instances_cfg_file");
 validate_config($global, $instances);
 $logger->info("CONFIG VALIDATION OK: instances=" . scalar(keys %$instances));
+$logger->info("STARTUP CHECKS OK: switching_to_configured_log=1");
+
+# Erst jetzt den in global.json angegebenen Logpfad vorbereiten. Bei einem Fehler
+# bleibt die vollständige Ursache im Journal und der Dienst startet nicht halb.
+my $file_logger;
+eval {
+  _prepare_configured_log(
+    $logfile,
+    $log_mode,
+    $global->{serviceUser},
+    $global->{serviceGroup},
+  );
+  $file_logger = _new_file_logger(
+    $logfile,
+    $log_mode,
+    $global->{serviceUser},
+    $global->{serviceGroup},
+    $effective_log_level,
+  );
+  1;
+} or do {
+  my $log_error = _single_line($@ || 'unbekannter Logger-Fehler');
+  my $fatal =
+    "LOGGER SWITCH FAILED: path=" . (defined($logfile) ? $logfile : '<missing>')
+    . " error=$log_error";
+  die $fatal . "\n";
+};
+
+# Erfolg noch im Journal bestätigen, dann Hauptlogger atomar umschalten.
+$logger->info("LOGGER SWITCH OK: path=$logfile");
+$logger = $file_logger;
+app->log($logger);
+
+# Der prozessweite __DIE__-Handler ist nur für die Startphase gedacht.
+$startup_die_handler_active = 0;
+$SIG{__DIE__} = 'DEFAULT';
+
+if ($effective_log_level ne $requested_log_level) {
+  $logger->warn("Ungültiges log_level '$requested_log_level'; verwende 'info'");
+}
+$logger->info(
+  "LOGGER READY: backend=Mojo::Log reopen_per_entry=1 path=$logfile "
+  . "encoding=UTF-8 level=$effective_log_level mode=" . sprintf('%04o', $log_mode)
+);
 
 # -------------------- Backups --------------------
 
@@ -1632,9 +1904,11 @@ post '/instances/:inst/globs' => sub {
 del '/instances/:inst/globs/:map' => sub {
   my $c    = shift;
   my $inst = $c->stash('inst');
-  my $map  = $c->stash('map');
   return $c->render(status=>404, json=>{ok=>0,error=>'Unknown instance'})
     unless exists $config->{instances}{$inst};
+
+  my ($map, $map_err) = sanitize_glob_key($c->stash('map'));
+  return $c->render(status=>400, json=>{ok=>0,error=>$map_err}) if $map_err;
 
   my ($had, $cfg_err);
   eval {
@@ -1643,6 +1917,7 @@ del '/instances/:inst/globs/:map' => sub {
       my $node = _inst_node_rw($cfg, $inst);
       $had = (ref($node->{globs}) eq 'HASH') && exists $node->{globs}{$map};
       delete $node->{globs}{$map} if $had;
+      validate_config($global, (ref($cfg->{instances}) eq 'HASH' ? $cfg->{instances} : $cfg));
       _write_cfg_hash_atomic($cfg);
       _rebuild_cfgmap_from($cfg);
     });
@@ -1685,9 +1960,8 @@ if ($ssl_enable && $ssl_cert && $ssl_key) {
 
 try {
   $logger->info("SERVICE START OK: version=$VERSION listen=$url require_https=".($require_https?1:0)." instances=".scalar(keys %$instances));
-  set_file_ownership_and_mode($logfile, $global->{serviceUser}, $global->{serviceGroup});
 } catch {
-  $logger->error("Logger-Fehler: $_");
+  $logger->error("Logger-Fehler: " . _single_line($_));
 };
 
 app->start('daemon', '-l', $url);
