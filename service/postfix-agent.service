@@ -1,65 +1,100 @@
 [Unit]
-Description=Postfix Management Agent API
-After=network.target postfix.service
+Description=Postfix Agent (hardened)
+Wants=network-online.target
+After=network.target network-online.target
+RequiresMountsFor=/opt/mmbb_services
 
 [Service]
-# Pfad zum Skript und Start-Kommando
-ExecStart=/usr/bin/perl /opt/postfix-agent/agent.pl
-WorkingDirectory=/opt/postfix-agent
-Restart=always
+Type=simple
 User=root
 Group=root
+EnvironmentFile=/opt/mmbb_services/env/postfix-agent.env
+WorkingDirectory=/opt/mmbb_services/postfix-agent
+ExecStart=/usr/bin/perl /opt/mmbb_services/postfix-agent/postfix-agent.pl
+UMask=0007
 
-# Lade die Umgebungsvariablen aus der Datei
-EnvironmentFile=/etc/postfix-agent.env
+# PATH + ENV härten
+Environment=PATH=/usr/bin:/usr/sbin
+UnsetEnvironment=PERL5LIB PERLLIB PERL5OPT IFS CDPATH ENV BASH_ENV LD_PRELOAD LD_LIBRARY_PATH
 
-# --- Sicherheits-Sandboxing ---
+# Restart
+TimeoutStartSec=30
+Restart=on-failure
+RestartSec=3s
 
-# 1. Das gesamte Dateisystem als leer (tmpfs) mounten
+# Sandboxing
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateMounts=true
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+KeyringMode=private
+ProcSubset=pid
+ProtectProc=invisible
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service chroot
+
+# Netzwerk nur Loopback
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# IPAddressDeny=any
+# IPAddressAllow=127.0.0.1 ::1
+
+# Temporäres Dateisystem restriktiv
 TemporaryFileSystem=/
 
-# 2. Notwendige System-Ordner für Perl und Postmap (Read-Only)
-BindReadOnlyPaths=/usr /lib /lib64 /bin /sbin /etc/alternatives /etc/perl /etc/ssl/certs
 
-# 3. Die Konfiguration des Agenten 
-BindReadOnlyPaths=/opt/postfix-agent/global.json
-BindPaths=/opt/postfix-agent/configs.json
+# --- Binaries / Libs (Read-Only) ---
+BindReadOnlyPaths=/usr:/usr
+BindReadOnlyPaths=/usr/share:/usr/share
+BindReadOnlyPaths=/lib:/lib
+BindReadOnlyPaths=/lib64:/lib64
+BindReadOnlyPaths=/bin:/bin
+BindReadOnlyPaths=/sbin:/sbin
 
-# 4. Arbeitsverzeichnisse für Postfix (Read-Write)
-# Hier liegen die Maps (virtual, aliases, etc.)
-BindPaths=/etc/postfix
+# --- /etc Basis (Read-Only) ---
+BindReadOnlyPaths=/etc/hosts
+BindReadOnlyPaths=/etc/resolv.conf
+BindReadOnlyPaths=/etc/nsswitch.conf
+BindReadOnlyPaths=/etc/localtime
+BindReadOnlyPaths=/etc/machine-id
 
-# 5. Logging und Backups (Read-Write)
-# Erstelle diese Ordner vorher, falls sie nicht existieren!
-BindPaths=/var/log
-BindPaths=/var/backups/postfix-agent
+# systemctl reload/status aus den fest konfigurierten Instanz-Kommandos.
+# Das Laufzeitverzeichnis bleibt read-only; Unix-Socket-Verbindungen bleiben moeglich.
+BindReadOnlyPaths=/run/systemd:/run/systemd
 
-# 6. Temporäre Dateien und Locks (isoliert)
-PrivateTmp=yes
-# Falls ein spezieller Lock-Ordner in der global.json definiert ist:
-BindPaths=/tmp
 
-# --- Weitere Kernel-Härtung ---
+#-----------------------------------
+# Verzeichnis schreiben
+#-----------------------------------
+BindPaths=/var/log:/var/log
+BindPaths=/opt/mmbb_services/postfix-agent:/opt/mmbb_services/postfix-agent
+BindPaths=/etc/postfix:/etc/postfix
 
-# Verhindert, dass der Prozess neue Privilegien erlangt
-NoNewPrivileges=yes
+#-----------------------------------
+# Verzeichnis lesen
+#-----------------------------------
+BindReadOnlyPaths=/etc/postfix/main.cf:/etc/postfix/main.cf
+BindReadOnlyPaths=/etc/postfix/master.cf:/etc/postfix/master.cf
 
-# Schützt Kernel-Einstellungen und Control-Groups
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
-ProtectKernelModules=yes
+# Caps minimal (keine nötig)
+CapabilityBoundingSet=CAP_CHOWN
 
-# Macht /home und /root komplett unsichtbar
-ProtectHome=yes
-
-# Verhindert Zugriff auf physische Geräte (außer /dev/null, /dev/random)
-PrivateDevices=yes
-
-# Beschränkt die Systemaufrufe (optional, falls postmap Probleme macht, weglassen)
-# SystemCallFilter=@system-service
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mmbb-postfix-agent
 
 [Install]
-
 WantedBy=multi-user.target
-
-
