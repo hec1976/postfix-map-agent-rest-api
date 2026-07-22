@@ -1,6 +1,87 @@
 #!/usr/bin/env perl
 # Postfix Map Agent - REST
-# Version: 1.4.10-hardened-compatible (2026-07-11)
+# Version: 1.4.16-hardened-compatible (2026-07-14)
+#
+# Änderungen ggü. 1.4.15:
+# - run_command_capture überwacht die Kind-PID auch dann weiter, wenn stdout
+#   und stderr bereits geschlossen sind. Der konfigurierte Timeout kann dadurch
+#   nicht mehr in einem blockierenden waitpid verloren gehen.
+# - JSON-Map-Inhalte werden strikt geparst: ungültiges JSON sowie Arrays/Objekte
+#   ohne skalaren content-Wert liefern HTTP 400. Raw-Body-UTF-8 wird verlustfrei
+#   validiert und nie still durch U+FFFD ersetzt.
+# - Überlappende Globs werden deterministisch nach Spezifität ausgewertet
+#   (exakter Key, längster Literalanteil, wenigste Wildcards, lexikalischer Tie-Break).
+# - Ein Statuskommando mit Exit-Code 0 gilt auch ohne Textausgabe als erfolgreich.
+# - Map- und Backup-Lesezugriffe öffnen reguläre Dateien mit O_NOFOLLOW und
+#   fstat-Prüfung. Backups werden symlinksicher und atomar geschrieben.
+# - Glob-Upserts validieren jedes Array-Element und lehnen widersprüchliche
+#   Mehrfachdefinitionen desselben Map-Keys ab.
+#
+# Änderungen ggü. 1.4.14:
+# - Die reine Endungssperre für .lmdb/.db/.dir/.pag wurde durch eine Prüfung des
+#   tatsächlichen Dateiinhalts ersetzt. Registrierte Text-Quelldateien mit einer
+#   solchen Endung bleiben zulässig; binäre DB-Artefakte werden abgelehnt.
+#
+# Änderungen ggü. 1.4.13:
+# - DELETE /instances/:inst/globs/#map verwendet jetzt einen relaxed
+#   Placeholder. Dadurch funktionieren auch registrierte Map-Keys mit Punkten
+#   wie check_sender.regexp oder transport.lmdb.source.
+# - Gelöscht wird ausschließlich ein exakt in configs.json -> globs
+#   registrierter Key. Wildcard-Muster werden nicht aufgelöst und es werden
+#   weiterhin keinerlei Dateien im Postfix-Dateisystem gelöscht.
+# - Nicht registrierte Keys führen zu HTTP 404 und configs.json wird dabei
+#   weder geschrieben noch neu aufgebaut.
+#
+# Änderungen ggü. 1.4.12:
+# - validate_config verwendet beim globalen backupDir-Fallback jetzt immer das
+#   tatsächlich übergebene Global-Objekt; Reload-Prüfungen greifen nicht mehr
+#   versehentlich auf die vorherige globale Konfiguration zu.
+# - allowed_ips wird vollständig beim Start/Reload normalisiert und mit
+#   Net::CIDR::cidrvalidate geprüft; fehlende Angabe bleibt kompatibel und wird
+#   auf 127.0.0.1/32 gesetzt. Der Request-Hook verwendet nur vorvalidierte Werte.
+# - Konfiguration wird vor dem Anlegen bzw. chmod/chown von Dienst-, Backup- und
+#   Temp-Verzeichnissen vollständig validiert.
+# - JSON content muss ein Skalar sein; Arrays/Objekte liefern HTTP 400 und werden
+#   nicht als Perl-Referenztext in eine Map geschrieben.
+# - waitpid wird bei EINTR wiederholt; sonstige sysread-Fehler beenden und reapen
+#   den Kindprozess kontrolliert statt als EOF zu gelten. syswrite behandelt
+#   EINTR korrekt und einen Null-Write als Fehler.
+#
+# Änderungen ggü. 1.4.11 (aus gezieltem Security-/Robustheitstest):
+# - KRITISCH: Ohne explizit gesetztes allowed_ips fiel der Code auf
+#   ['127.0.0.1'] zurück, aber Net::CIDR::cidrlookup verlangt zwingend eine
+#   CIDR-Notation mit Prefix. Der Aufruf warf eine Exception, die von eval()
+#   still verschluckt wurde: JEDE Anfrage wurde als "Forbidden" abgelehnt,
+#   auch von localhost. Verifiziert reproduzierbar. Default korrigiert auf
+#   '127.0.0.1/32', zusätzlich werden alle konfigurierten allowed_ips-Einträge
+#   ohne Prefix automatisch normalisiert (/32 bzw. /128), damit derselbe
+#   Fehler nicht bei eigener Fehlkonfiguration erneut auftritt. Fehler beim
+#   CIDR-Lookup werden jetzt zusätzlich geloggt statt still zu verschwinden.
+# - KRITISCH: Request-Body über app->max_request_size (2 MiB) wurde von
+#   Mojolicious still gekürzt, die Antwort meldete trotzdem Erfolg.
+#   Verifiziert: 5-MB-Upload wurde auf exakt 2 MiB gekürzt, ok=1. Body wird
+#   jetzt vor und nach dem Lesen auf is_limit_exceeded geprüft, HTTP 413 bei
+#   Überschreitung statt stillem Datenverlust.
+# - Waisenprozess-Schutz: setpgid($pid,$pid) aus dem Elternprozess nach
+#   open3 schlägt zuverlässig fehl, sobald das Kind bereits exec't hat
+#   (praktisch immer der Fall). Verifiziert: ein von reload_cmd gestarteter
+#   Hintergrundprozess überlebte den Timeout-Kill. Ersetzt durch setsid(1)-
+#   Wrapper (wie bei config_manager erprobt), exec't ohne zusätzlichen Fork
+#   in-place, setzt aber eine neue Prozessgruppe.
+# - sysread-Fehler durch EINTR wurden wie ein echtes EOF behandelt
+#   (Stream wurde vorzeitig als beendet markiert). Jetzt wird bei EINTR der
+#   Lesevorgang für den betroffenen Descriptor im nächsten Durchlauf einfach
+#   wiederholt.
+#
+# Änderungen ggü. 1.4.10:
+# - JSON::MaybeXS entfernt: Mojo::JSON für Lesen/API-Inhalte, JSON::PP (Perl-Core)
+#   nur für die lesbare kanonische Ausgabe von configs.json.
+# - Try::Tiny entfernt; Fehlerbehandlung verwendet ausschließlich Perl-Core eval.
+# - Eigener Tokenvergleich entfernt; Mojo::Util::secure_compare wird verwendet.
+# - Numerische Dateimodi, signalbeendete Kommandos, Status-Gesamttimeout und
+#   Lockdatei-Öffnung wurden zusätzlich korrigiert/gehärtet.
+# - REST-Endpunkte, Konfigurationsformat, Backup/Restore, postmap, Reload/Status
+#   und die bewusst gewählte No-Auto-Rollback-Policy bleiben unverändert.
 #
 # Änderungen ggü. 1.4.9:
 # - Dateilog wird pro Logeintrag mit O_APPEND|O_CREAT geöffnet und wieder geschlossen.
@@ -12,7 +93,7 @@
 #   erfolgreichen Logger-Wechsel gilt wieder Perls Standardverhalten. Fehler in
 #   Mojolicious-Request-Handlern beenden damit nicht versehentlich den Daemon.
 # - DELETE /instances/:inst/globs/:map und der globale backupDir-Fallback bleiben
-#   wie in 1.4.9 konsistent:wq validiert.
+#   wie in 1.4.9 konsistent validiert.
 #
 # Security-/Robustheits-Hardening gegenüber 1.3.3:
 # - Voll rückwärtskompatibel zu bestehender global.json/configs.json (keine Pflichtänderung)
@@ -71,26 +152,23 @@ binmode STDOUT, ':raw';
 binmode STDERR, ':raw';
 
 use Mojolicious::Lite;
-use JSON::MaybeXS;
 use File::Basename qw(basename dirname);
-use File::Copy qw(copy);
-use POSIX qw(strftime setpgid);
+use POSIX qw(strftime WNOHANG);
 use FindBin qw($Bin);
 use Mojo::Log;
-use Try::Tiny;
 use File::Temp qw(tempfile);
 use File::Path qw(make_path);
 use File::Spec;
-use Encode qw(decode decode_utf8 encode FB_CROAK);
+use Encode qw(decode encode FB_CROAK);
 use Net::CIDR;
-use Mojo::Util qw(url_escape);
-use Mojo::JSON qw(true false);
-use Fcntl qw(:mode O_CREAT O_EXCL O_WRONLY O_RDWR O_APPEND :flock);
-use Errno qw(EEXIST ENOENT);
+use Mojo::Util qw(url_escape secure_compare);
+use Mojo::JSON qw(from_json true false);
+use JSON::PP ();
+use Fcntl qw(:mode O_RDONLY O_CREAT O_EXCL O_WRONLY O_RDWR O_APPEND :flock);
+use Errno qw(EEXIST ENOENT EINTR);
 use Time::HiRes qw(time sleep);
 use IPC::Open3 qw(open3);
 use IO::Select;
-use IO::Handle ();
 use Symbol qw(gensym);
 
 
@@ -100,7 +178,7 @@ use constant STATUS_TIMEOUT_S     => 5.0;
 use constant STATUS_POLL_S        => 0.25;
 use constant MAX_COMMAND_OUTPUT_B => 1_048_576;
 
-our $VERSION = '1.4.10-hardened-compatible';
+our $VERSION = '1.4.16-hardened-compatible';
 # Umask bewusst restriktiv: Group-RW, Other none
 umask 0007;
 
@@ -271,10 +349,16 @@ sub _write_utf8_log_line {
     while ($offset < $length) {
       my $written = syswrite($fh, $bytes, $length - $offset, $offset);
       if (!defined $written) {
+        next if $!{EINTR};
         my $err = $!;
         flock($fh, LOCK_UN);
         close $fh;
         die "Kann Logdatei $path nicht schreiben: $err";
+      }
+      if ($written == 0) {
+        flock($fh, LOCK_UN);
+        close $fh;
+        die "Kann Logdatei $path nicht schreiben: syswrite lieferte 0 Bytes";
       }
       $offset += $written;
     }
@@ -375,6 +459,101 @@ sub read_text {
   return $data;
 }
 
+# Für durch die API adressierbare Map-/Backup-Dateien reicht eine vorgelagerte
+# -l-Prüfung nicht: Der Pfad könnte zwischen Prüfung und open() ausgetauscht
+# werden. Deshalb wird der Pfad mit O_NOFOLLOW geöffnet und anschließend der
+# bereits geöffnete Deskriptor als reguläre Datei verifiziert. Auf Plattformen
+# ohne O_NOFOLLOW verhindert der Vergleich mit lstat/stat das Folgen eines
+# Symlinks beziehungsweise einen Pfadaustausch vor der Verifikation.
+sub _open_regular_read {
+  my ($file, $label) = @_;
+  $label //= 'Datei';
+
+  my $flags = O_RDONLY | $o_nofollow;
+  sysopen(my $fh, $file, $flags)
+    or die "$label kann nicht sicher geöffnet werden: $file: $!";
+  binmode($fh, ':raw') or do {
+    my $err = $!;
+    close $fh;
+    die "binmode($file) fehlgeschlagen: $err";
+  };
+
+  my @fh_stat = stat($fh);
+  unless (@fh_stat && S_ISREG($fh_stat[2])) {
+    close $fh;
+    die "$label ist keine reguläre Datei: $file";
+  }
+
+  unless ($o_nofollow) {
+    my @link_stat = lstat($file);
+    my @path_stat = stat($file);
+    unless (@link_stat && @path_stat
+        && !S_ISLNK($link_stat[2])
+        && $fh_stat[0] == $path_stat[0]
+        && $fh_stat[1] == $path_stat[1]) {
+      close $fh;
+      die "$label wurde während des Öffnens ausgetauscht oder ist ein Symlink: $file";
+    }
+  }
+
+  return $fh;
+}
+
+sub read_raw_regular {
+  my ($file, $label) = @_;
+  my $fh = _open_regular_read($file, $label);
+  my $data = '';
+
+  while (1) {
+    my $chunk = '';
+    my $n = sysread($fh, $chunk, 64 * 1024);
+    if (!defined $n) {
+      next if $!{EINTR};
+      my $err = $!;
+      close $fh;
+      die "Kann $file nicht lesen: $err";
+    }
+    last if $n == 0;
+    $data .= $chunk;
+  }
+
+  close $fh or die "Kann $file nicht schließen: $!";
+  return $data;
+}
+
+sub read_text_regular {
+  my ($file, $label) = @_;
+  my $bytes = read_raw_regular($file, $label);
+  my $text = eval { decode('UTF-8', $bytes, FB_CROAK) };
+  die (($label // 'Datei') . " enthält kein gültiges UTF-8: $file: " . _single_line($@))
+    if $@;
+  return $text;
+}
+
+sub read_regular_prefix {
+  my ($file, $limit, $label) = @_;
+  $limit = 8192 unless defined($limit) && $limit > 0;
+  my $fh = _open_regular_read($file, $label);
+  my $data = '';
+
+  while (length($data) < $limit) {
+    my $chunk = '';
+    my $want = $limit - length($data);
+    my $n = sysread($fh, $chunk, $want);
+    if (!defined $n) {
+      next if $!{EINTR};
+      my $err = $!;
+      close $fh;
+      die "Kann $file nicht lesen: $err";
+    }
+    last if $n == 0;
+    $data .= $chunk;
+  }
+
+  close $fh or die "Kann $file nicht schließen: $!";
+  return $data;
+}
+
 sub _random_secret {
   my $bytes = '';
   if (open my $fh, '<:raw', '/dev/urandom') {
@@ -383,20 +562,6 @@ sub _random_secret {
     return unpack('H*', $bytes) if defined $read && $read == 48;
   }
   die "Sicherer Zufallsgenerator /dev/urandom ist nicht verfügbar";
-}
-
-sub _constant_time_eq {
-  my ($a, $b) = @_;
-  $a //= '';
-  $b //= '';
-  my $diff = length($a) ^ length($b);
-  my $max  = length($a) > length($b) ? length($a) : length($b);
-  for my $i (0 .. ($max ? $max - 1 : 0)) {
-    my $ca = $i < length($a) ? ord(substr($a, $i, 1)) : 0;
-    my $cb = $i < length($b) ? ord(substr($b, $i, 1)) : 0;
-    $diff |= ($ca ^ $cb);
-  }
-  return $diff == 0;
 }
 
 sub _shell_quote {
@@ -415,8 +580,15 @@ sub _is_loopback_listen {
 sub _normalize_mode {
   my ($m) = @_;
   return unless defined $m;
-  return oct($m) if "$m" =~ /^[0-7]{3,4}$/;  # "0644" -> 420
-  return $m if "$m" =~ /^\d+$/;              # 420 -> 420
+
+  my $text = "$m";
+
+  # Konfigurationsstrings wie "0644"/"0660" sind oktal.
+  return oct($text) if $text =~ /\A0[0-7]{3}\z/;
+
+  # Numerische JSON-Werte sind bereits dezimal (z. B. 420 == 0644).
+  return 0 + $text if $text =~ /\A\d+\z/ && $text >= 0 && $text <= 4095;
+
   return;
 }
 
@@ -428,7 +600,7 @@ sub read_json_config {
     or die "CONFIG READ FAILED: file=$file error=" . _single_line($@);
 
   my $data;
-  eval { $data = JSON::MaybeXS->new(utf8=>0)->decode($text); 1 }
+  eval { $data = from_json($text); 1 }
     or die "CONFIG JSON INVALID: file=$file error=" . _single_line($@);
 
   return $data;
@@ -540,53 +712,71 @@ sub effective_service_dir_mode {
     : '0770';
 }
 
-# Backup-Fallback: backupDir/<inst>
+# Backup-Fallback: backupDir/<inst>. Für Validierungs- und Reload-Pfade kann
+# ausdrücklich das zu prüfende Global-Objekt übergeben werden.
 sub effective_backup_dir {
-  my ($ci, $inst) = @_;
-  return $ci->{backup_dir} if $ci && $ci->{backup_dir};
-  return File::Spec->catdir($global->{backupDir}, $inst) if $global->{backupDir};
+  my ($ci, $inst, $g) = @_;
+  $g //= $global;
+
+  return $ci->{backup_dir}
+    if $ci && defined($ci->{backup_dir}) && length($ci->{backup_dir});
+  return File::Spec->catdir($g->{backupDir}, $inst)
+    if $g && defined($g->{backupDir}) && length($g->{backupDir});
   return; # kein Fallback
 }
 
-# Globale Dienstverzeichnisse anlegen/absichern
-if (my $dconf = $global->{dirs}) {
-  my $folders = $dconf->{service_folder};
-  $folders = [] unless defined $folders;
-  $folders = [$folders] unless ref $folders eq 'ARRAY';
-  my $owner = $global->{serviceUser};
-  my $group = $global->{serviceGroup};
-  my $mode  = effective_service_dir_mode();
-
-  foreach my $fldkey (@$folders) {
-    my $dir = $global->{$fldkey} // next;
-    unless (-d $dir) {
-      eval { make_path($dir) };
-      die "Kann Verzeichnis $dir nicht anlegen: $@" if $@;
-    }
-    my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
-    $logger->warn($err) if $err;
-  }
-}
-
-# Instanz-Backupverzeichnisse sicherstellen
-{
-  my $owner = $global->{serviceUser};
-  my $group = $global->{serviceGroup};
-  my $mode  = effective_service_dir_mode();
-  for my $name (keys %$instances) {
-    my $dir = effective_backup_dir($instances->{$name}, $name) // next;
-    unless (-d $dir) {
-      eval { make_path($dir) };
-      if ($@) { $logger->error("Backup-Verzeichnis $dir konnte nicht erstellt werden: $@"); next; }
-    }
-    my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
-    $logger->warn($err) if $err;
-  }
-}
-
-# tmp-dir
+# Der Wert wird bereits benötigt, bevor die Verzeichnisse nach erfolgreicher
+# Konfigurationsvalidierung tatsächlich vorbereitet werden.
 my $tmp_dir = $global->{tmpDir} // '/tmp';
-unless (-d $tmp_dir) { eval { make_path($tmp_dir) }; die "Konnte tmp_dir $tmp_dir nicht anlegen: $@" if $@; }
+
+sub _prepare_runtime_directories {
+  # Globale Dienstverzeichnisse anlegen/absichern
+  if (my $dconf = $global->{dirs}) {
+    my $folders = $dconf->{service_folder};
+    $folders = [] unless defined $folders;
+    $folders = [$folders] unless ref $folders eq 'ARRAY';
+    my $owner = $global->{serviceUser};
+    my $group = $global->{serviceGroup};
+    my $mode  = effective_service_dir_mode();
+
+    foreach my $fldkey (@$folders) {
+      my $dir = $global->{$fldkey} // next;
+      unless (-d $dir) {
+        eval { make_path($dir) };
+        die "Kann Verzeichnis $dir nicht anlegen: $@" if $@;
+      }
+      my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
+      $logger->warn($err) if $err;
+    }
+  }
+
+  # Instanz-Backupverzeichnisse sicherstellen
+  {
+    my $owner = $global->{serviceUser};
+    my $group = $global->{serviceGroup};
+    my $mode  = effective_service_dir_mode();
+    for my $name (keys %$instances) {
+      my $dir = effective_backup_dir($instances->{$name}, $name, $global) // next;
+      unless (-d $dir) {
+        eval { make_path($dir) };
+        if ($@) {
+          $logger->error("Backup-Verzeichnis $dir konnte nicht erstellt werden: $@");
+          next;
+        }
+      }
+      my $err = set_dir_ownership_and_mode($dir, $owner, $group, $mode);
+      $logger->warn($err) if $err;
+    }
+  }
+
+  # tmp-dir
+  unless (-d $tmp_dir) {
+    eval { make_path($tmp_dir) };
+    die "Konnte tmp_dir $tmp_dir nicht anlegen: $@" if $@;
+  }
+
+  return 1;
+}
 
 # Zusammengeführte Config (mutable via reload_config / _rebuild_cfgmap_from)
 my $config = { global => $global, instances => $instances };
@@ -609,6 +799,42 @@ sub atomic_write {
   my $ok = eval {
     binmode($fh, ':encoding(UTF-8)') or die "binmode($tmpfile) failed: $!";
     print {$fh} (defined($content) ? $content : '') or die "write($tmpfile) failed: $!";
+    close $fh or die "close($tmpfile) failed: $!";
+
+    my $perm_err = set_file_ownership_and_mode($tmpfile, $user, $group, $mode);
+    die "Berechtigungen für $tmpfile fehlgeschlagen: $perm_err" if $perm_err;
+
+    rename $tmpfile, $path or die "rename($tmpfile -> $path) failed: $!";
+    $tmpfile = undef;
+    1;
+  };
+  my $err = $@;
+  close $fh if defined(fileno($fh));
+  unlink $tmpfile if defined($tmpfile) && -e $tmpfile;
+  die $err unless $ok;
+  return 1;
+}
+
+sub atomic_write_raw {
+  my ($path, $bytes, $user, $group, $mode) = @_;
+  my $dir = dirname($path);
+  die "Verzeichnis nicht beschreibbar: $dir" unless -d $dir && -w $dir;
+  _assert_not_symlink($path, 'Zieldatei');
+
+  my ($fh, $tmpfile) = tempfile('.tmp_XXXXXXXX', DIR => $dir, UNLINK => 0);
+  my $ok = eval {
+    binmode($fh, ':raw') or die "binmode($tmpfile) failed: $!";
+    my $offset = 0;
+    my $length = length($bytes // '');
+    while ($offset < $length) {
+      my $written = syswrite($fh, $bytes, $length - $offset, $offset);
+      if (!defined $written) {
+        next if $!{EINTR};
+        die "write($tmpfile) failed: $!";
+      }
+      die "write($tmpfile) lieferte 0 Bytes" if $written == 0;
+      $offset += $written;
+    }
     close $fh or die "close($tmpfile) failed: $!";
 
     my $perm_err = set_file_ownership_and_mode($tmpfile, $user, $group, $mode);
@@ -704,6 +930,37 @@ if (defined($min_token_length) && $min_token_length =~ /\A\d+\z/ && $min_token_l
   $logger->warn("API_TOKEN ist kürzer als 24 Zeichen; aus Kompatibilitätsgründen wird der Start nicht blockiert.");
 }
 
+sub _normalize_allowed_ips {
+  my ($entries) = @_;
+  $entries = ['127.0.0.1/32'] unless defined $entries;
+
+  die "allowed_ips muss ein nicht-leeres Array sein"
+    unless ref($entries) eq 'ARRAY' && @$entries;
+
+  my @normalized;
+  for my $raw (@$entries) {
+    die "allowed_ips enthält keinen gültigen String"
+      if !defined($raw) || ref($raw);
+
+    my $entry = "$raw";
+    $entry =~ s/^\s+|\s+$//g;
+    die "allowed_ips enthält einen leeren Eintrag" unless length($entry);
+    die "allowed_ips enthält Steuerzeichen" if $entry =~ /[\x00\r\n]/;
+
+    $entry .= ($entry =~ /:/ ? '/128' : '/32') unless $entry =~ m{/};
+
+    my $validated = eval { Net::CIDR::cidrvalidate($entry) };
+    my $validation_error = $@;
+    die "Ungültiger allowed_ips-Eintrag '$raw': " . _single_line($validation_error)
+      if $validation_error;
+    die "Ungültiger allowed_ips-Eintrag '$raw'" unless defined($validated);
+
+    push @normalized, $validated;
+  }
+
+  return \@normalized;
+}
+
 sub _cors_origin_allowed {
   my ($origin) = @_;
   return 0 unless defined $origin && length $origin;
@@ -727,8 +984,10 @@ if (!exists $config->{global}{allowed_origins}) {
 hook before_dispatch => sub {
   my $c = shift;
 
-  my $ips_rt = $config->{global}{allowed_ips};
-  my @acl_rt = @{ (ref($ips_rt) eq 'ARRAY' && @$ips_rt ? $ips_rt : ['127.0.0.1']) };
+  # validate_config normalisiert und validiert allowed_ips bereits beim Start
+  # bzw. vor einem Config-Reload. Der Request-Pfad arbeitet nur noch mit der
+  # akzeptierten CIDR-Liste.
+  my @acl_rt = @{ $config->{global}{allowed_ips} };
 
   my $origin = $c->req->headers->origin // '';
   if ($origin) {
@@ -751,6 +1010,9 @@ hook before_dispatch => sub {
 
   my $remote = $c->tx->remote_address // '';
   my $acl_ok = eval { Net::CIDR::cidrlookup($remote, @acl_rt) } ? 1 : 0;
+  if (!$acl_ok && $@) {
+    $logger->error("IP-ACL-Pruefung fehlgeschlagen (allowed_ips ungueltig?): $@");
+  }
   unless ($acl_ok) {
     return $c->render(status => 403, json => { ok => 0, error => 'Forbidden' });
   }
@@ -762,7 +1024,7 @@ hook before_dispatch => sub {
   my $hdr_token = $c->req->headers->header('X-API-Token') // '';
   my $bearer    = ($c->req->headers->authorization // '') =~ /^Bearer\s+(.+)/i ? $1 : '';
   my $token     = $hdr_token || $bearer;
-  unless (_constant_time_eq($token, $api_token)) {
+  unless (secure_compare($token, $api_token)) {
     return $c->render(status => 401, json => { ok => 0, error => 'Unauthorized' });
   }
 };
@@ -803,7 +1065,7 @@ sub reload_config {
 }
 
 sub _read_cfg_hash {
-  my $cfg = JSON::MaybeXS->new(utf8=>0)->decode( read_text($instances_cfg_file) );
+  my $cfg = from_json(read_text($instances_cfg_file));
   return $cfg;
 }
 
@@ -816,7 +1078,15 @@ sub _inst_node_rw {
 
 sub _write_cfg_hash_atomic {
   my ($cfg) = @_;
-  my $json = JSON::MaybeXS->new(utf8=>0, canonical=>1, pretty=>1)->encode($cfg);
+
+  # JSON::PP ist Perl-Core und bewahrt die bisherige lesbare, kanonische
+  # configs.json-Ausgabe. Mojo::JSON bleibt für Parsing und API-Inhalte zuständig.
+  my $json = JSON::PP->new
+    ->canonical(1)
+    ->pretty(1)
+    ->allow_nonref(1)
+    ->encode($cfg);
+
   atomic_write_umask($instances_cfg_file, $json, $global->{serviceUser}, $global->{serviceGroup});
 }
 
@@ -849,8 +1119,27 @@ my %FORBIDDEN = map { $_ => 1 } qw(
 sub _deny_forbidden_map {
   my ($name) = @_;
   return 1 if $FORBIDDEN{ lc($name // '') };
-  return 1 if ($name // '') =~ /\.(?:lmdb|db|dir|pag)$/i;
   return 0;
+}
+
+sub _is_compiled_map_artifact {
+  my ($name, $path) = @_;
+  return 0 unless ($name // '') =~ /\.(?:lmdb|db|dir|pag)$/i;
+  return 0 unless defined($path) && (-e $path || -l $path);
+  return 1 if -l $path || !-f $path;
+
+  my $prefix = read_regular_prefix($path, 8192, 'Map-Datei');
+  return 1 if $prefix =~ /\x00/;
+  return 1 if $prefix =~ /[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/;
+
+  my $copy = $prefix;
+  my $utf8_ok = eval { decode('UTF-8', $copy, FB_CROAK); 1 };
+  return $utf8_ok ? 0 : 1;
+}
+
+sub _deny_compiled_map_artifact {
+  my ($name, $path) = @_;
+  return _is_compiled_map_artifact($name, $path) ? 1 : 0;
 }
 
 sub _require_registered_map {
@@ -890,14 +1179,33 @@ sub map_type_for_file {
   my ($ci, $file) = @_;
   my $globs = $ci->{globs} // {};
   return $globs->{$file} if exists $globs->{$file};
+
+  my @matches;
   for my $glob (keys %$globs) {
     next if $glob eq $file;
     my $type = $globs->{$glob};
     my $re = quotemeta($glob);
     $re =~ s/\\\*/.*/g;
-    return $type if $file =~ /\A$re\z/;
+    next unless $file =~ /\A$re\z/;
+
+    my $literal = $glob;
+    my $stars = ($literal =~ tr/*/*/);
+    $literal =~ s/\*//g;
+    push @matches, {
+      glob        => $glob,
+      type        => $type,
+      literal_len => length($literal),
+      stars       => $stars,
+    };
   }
-  return;
+
+  return unless @matches;
+  @matches = sort {
+       $b->{literal_len} <=> $a->{literal_len}
+    || $a->{stars}       <=> $b->{stars}
+    || $a->{glob}        cmp $b->{glob}
+  } @matches;
+  return $matches[0]{type};
 }
 
 # -------------------- Kommandoplätze / sichere Ausführung --------------------
@@ -957,6 +1265,38 @@ sub postmap_cmd {
   return $cmd;
 }
 
+sub _waitpid_status {
+  my ($pid, $label) = @_;
+  $label //= 'command';
+
+  while (1) {
+    my $waited = waitpid($pid, 0);
+    return $? if $waited == $pid;
+    next if $waited == -1 && $!{EINTR};
+    die "$label: waitpid($pid) fehlgeschlagen: $!" if $waited == -1;
+  }
+}
+
+sub _terminate_and_reap {
+  my ($pid, $label) = @_;
+  kill 'TERM', -$pid;
+  kill 'TERM',  $pid;
+  sleep 0.20;
+  kill 'KILL', -$pid;
+  kill 'KILL',  $pid;
+  return _waitpid_status($pid, $label);
+}
+
+sub _terminate_process_group {
+  my ($pid) = @_;
+  kill 'TERM', -$pid;
+  kill 'TERM',  $pid;
+  sleep 0.20;
+  kill 'KILL', -$pid;
+  kill 'KILL',  $pid;
+  return 1;
+}
+
 sub run_command_capture {
   my (%opt) = @_;
   my $label   = $opt{label}   // 'command';
@@ -966,24 +1306,61 @@ sub run_command_capture {
 
   my $stderr = gensym;
   my ($stdout, $pid);
-  $pid = open3(undef, $stdout, $stderr, '/bin/sh', '-c', $cmd);
-  eval { setpgid($pid, $pid) };
+  # In eigene Session/Prozessgruppe starten. Ein blosses setpgid($pid,$pid)
+  # aus dem Elternprozess (frueheres Verhalten) schlaegt zuverlaessig fehl,
+  # sobald das Kind bereits exec't hat, was bei einem schnellen /bin/sh -c
+  # praktisch immer der Fall ist (POSIX: setpgid auf ein bereits exec'tes
+  # Kind liefert EACCES). setsid(1) exec't dagegen im Normalfall ohne
+  # zusaetzlichen Fork in-place (gleiche PID, Pipes bleiben gueltig) und
+  # setzt dabei PGID=eigene PID, wodurch kill(-$pid) im Timeout-Fall auch
+  # von der Shell gestartete Hintergrundprozesse mitbeendet. Kein setsid
+  # vorhanden -> ohne Wrapper weiterlaufen (bisheriges Verhalten als Fallback).
+  my @cmd_argv = ('/bin/sh', '-c', $cmd);
+  my ($setsid_bin) = grep { -x $_ } qw(/usr/bin/setsid /bin/setsid);
+  unshift @cmd_argv, $setsid_bin, '--' if $setsid_bin;
+  $pid = open3(undef, $stdout, $stderr, @cmd_argv);
   my $selector = IO::Select->new($stdout, $stderr);
   my $deadline = time + $timeout;
   my $output = '';
   my $truncated = 0;
+  my $child_reaped = 0;
+  my $wait_status;
 
-  while ($selector->count) {
+  while (!$child_reaped || $selector->count) {
+    unless ($child_reaped) {
+      my $waited = waitpid($pid, WNOHANG);
+      if ($waited == $pid) {
+        $wait_status = $?;
+        $child_reaped = 1;
+      } elsif ($waited == -1 && !$!{EINTR}) {
+        die "$label: waitpid($pid) fehlgeschlagen: $!";
+      }
+    }
+
+    last if $child_reaped && !$selector->count;
+
     my $remaining = $deadline - time;
     if ($remaining <= 0) {
-      kill 'TERM', -$pid;
-      kill 'TERM',  $pid;
-      sleep 0.20;
-      kill 'KILL', -$pid;
-      kill 'KILL',  $pid;
-      waitpid($pid, 0);
+      if ($child_reaped) {
+        # Der direkte Kindprozess kann beendet sein, während ein von ihm
+        # gestarteter Prozess die Pipes noch offen hält.
+        _terminate_process_group($pid);
+      } else {
+        $wait_status = _terminate_and_reap($pid, $label);
+        $child_reaped = 1;
+      }
+      for my $fh ($selector->handles) {
+        $selector->remove($fh);
+        close $fh;
+      }
       die "$label timeout nach ${timeout}s: $cmd";
     }
+
+    unless ($selector->count) {
+      sleep($remaining > 0.05 ? 0.05 : $remaining);
+      next;
+    }
+
     my @ready = $selector->can_read($remaining > 0.25 ? 0.25 : $remaining);
     next unless @ready;
     for my $fh (@ready) {
@@ -997,23 +1374,40 @@ sub run_command_capture {
         } else {
           $truncated = 1;
         }
+      } elsif (!defined($n) && $!{EINTR}) {
+        # Unterbrochener Syscall: kein EOF, im naechsten Durchlauf erneut versuchen.
+        next;
+      } elsif (!defined($n)) {
+        my $read_error = "$!";
+        $selector->remove($fh);
+        close $fh;
+        if ($child_reaped) {
+          _terminate_process_group($pid);
+        } else {
+          $wait_status = _terminate_and_reap($pid, $label);
+          $child_reaped = 1;
+        }
+        die "$label: Fehler beim Lesen der Kommandoausgabe: $read_error";
       } else {
+        # Reguläres EOF (n == 0).
         $selector->remove($fh);
         close $fh;
       }
     }
   }
-  waitpid($pid, 0);
-  my $rc = $? >> 8;
+
+  $wait_status = _waitpid_status($pid, $label) unless $child_reaped;
+  my $signal      = $wait_status & 127;
+  my $rc          = $signal ? 128 + $signal : ($wait_status >> 8);
+
   $output .= "\n[output truncated]" if $truncated;
+  $output .= "\n[terminated by signal $signal]" if $signal;
   return ($rc, $output);
 }
 
 sub _status_is_running {
   my ($rc, $out) = @_;
-  return 0 unless $rc == 0;
-  return 1 if $out =~ /(?:is\s+running|^active\b|^running\b)/im;
-  return 0;
+  return $rc == 0 ? 1 : 0;
 }
 
 sub execute_postmap {
@@ -1086,14 +1480,24 @@ sub execute_reload_and_status {
   }
 
   $logger->info("STATUS CHECK START: instance=$inst command=$status_cmd");
-  my $deadline = time + ($ci->{status_timeout} // $global->{status_timeout} // STATUS_TIMEOUT_S);
+  my $status_timeout = $ci->{status_timeout} // $global->{status_timeout} // STATUS_TIMEOUT_S;
+  my $deadline = time + $status_timeout;
   my ($last_rc, $last_out) = (255, '');
 
-  while (time < $deadline) {
+  while (1) {
+    my $remaining = $deadline - time;
+    last if $remaining <= 0;
+
+    my $command_timeout =
+      $ci->{status_command_timeout}
+      // $global->{status_command_timeout}
+      // COMMAND_TIMEOUT_S;
+    $command_timeout = $remaining if $command_timeout > $remaining;
+
     ($last_rc, $last_out) = run_command_capture(
       label   => 'status',
       command => $status_cmd,
-      timeout => $ci->{status_command_timeout} // $global->{status_command_timeout} // COMMAND_TIMEOUT_S,
+      timeout => $command_timeout,
     );
     if (_status_is_running($last_rc, $last_out)) {
       $result->{status} = {
@@ -1121,10 +1525,9 @@ sub validate_config {
   if (exists $g->{allowed_origins}) {
     die "allowed_origins muss ein Array sein" unless ref($g->{allowed_origins}) eq 'ARRAY';
   }
-  if (exists $g->{allowed_ips}) {
-    die "allowed_ips muss ein nicht-leeres Array sein"
-      unless ref($g->{allowed_ips}) eq 'ARRAY' && @{$g->{allowed_ips}};
-  }
+  $g->{allowed_ips} = _normalize_allowed_ips(
+    exists($g->{allowed_ips}) ? $g->{allowed_ips} : undef
+  );
 
   for my $inst (sort keys %$insts) {
     my $ci = $insts->{$inst};
@@ -1136,7 +1539,7 @@ sub validate_config {
       die "Instanz '$inst': $key muss absolut sein ($ci->{$key})" unless File::Spec->file_name_is_absolute($ci->{$key});
     }
 
-    my $effective_bdir = effective_backup_dir($ci, $inst);
+    my $effective_bdir = effective_backup_dir($ci, $inst, $g);
     die "Instanz '$inst': weder backup_dir noch globales backupDir konfiguriert"
       unless defined($effective_bdir) && length($effective_bdir);
     die "Instanz '$inst': Backup-Pfad enthält Steuerzeichen"
@@ -1199,6 +1602,8 @@ sub validate_config {
 $logger->info("CONFIG VALIDATION START: global=$global_cfg_file instances=$instances_cfg_file");
 validate_config($global, $instances);
 $logger->info("CONFIG VALIDATION OK: instances=" . scalar(keys %$instances));
+_prepare_runtime_directories();
+$logger->info("RUNTIME DIRECTORIES OK");
 $logger->info("STARTUP CHECKS OK: switching_to_configured_log=1");
 
 # Erst jetzt den in global.json angegebenen Logpfad vorbereiten. Bei einem Fehler
@@ -1249,8 +1654,9 @@ $logger->info(
 sub backup_file {
   my ($file, $dir, $max, $ci) = @_;
   die "Backup-Quelldatei fehlt: $file" unless -f $file;
-  _assert_not_symlink($file, 'Backup-Quelldatei');
   die "Backup-Verzeichnis ist nicht konfiguriert" unless defined($dir) && length($dir);
+  die "max_backups muss eine nicht-negative Ganzzahl sein"
+    unless defined($max) && $max =~ /\A\d+\z/;
 
   unless (-d $dir) {
     make_path($dir) or die "Backup-Verzeichnis $dir konnte nicht erstellt werden: $!";
@@ -1265,10 +1671,15 @@ sub backup_file {
   my $dst = File::Spec->catfile($dir, basename($file) . ".bak.$ts");
   $logger->info("Erstelle Backup von $file nach $dst");
 
-  copy($file, $dst) or die "Backup fehlgeschlagen ($file -> $dst): $!";
+  my $source_bytes = read_raw_regular($file, 'Backup-Quelldatei');
   my $bk_mode = effective_backup_mode();
-  my $err = set_file_ownership_and_mode($dst, $global->{serviceUser}, $global->{serviceGroup}, $bk_mode);
-  die "Backup-Berechtigungen für $dst fehlgeschlagen: $err" if $err;
+  atomic_write_raw(
+    $dst,
+    $source_bytes,
+    $global->{serviceUser},
+    $global->{serviceGroup},
+    $bk_mode,
+  );
   $logger->info("BACKUP OK: source=$file target=$dst");
 
   my @bak = grep { -f $_ && !-l $_ } glob(File::Spec->catfile($dir, basename($file) . '.bak.*'));
@@ -1298,6 +1709,26 @@ sub _map_lock_path {
   return File::Spec->catfile($ldir, "$map.lock");
 }
 
+sub _open_lock_file {
+  my ($path, $label) = @_;
+  $label //= 'Lockfile';
+
+  die "$label ist ein Symlink und wird abgelehnt: $path"
+    if !$o_nofollow && -l $path;
+
+  my $flags = O_RDWR | O_CREAT | $o_nofollow;
+  sysopen(my $fh, $path, $flags, 0660)
+    or die "$label open failed $path: $!";
+
+  my @st = stat($fh);
+  unless (@st && S_ISREG($st[2])) {
+    close $fh;
+    die "$label ist keine reguläre Datei: $path";
+  }
+
+  return $fh;
+}
+
 sub with_map_lock {
   my ($ci, $map, $exclusive, $code, $inst) = @_;
   $inst //= '';
@@ -1311,8 +1742,7 @@ sub with_map_lock {
   die "Lock-Verzeichnis-Rechte fehlgeschlagen: $dir_err" if $dir_err;
 
   my $lpath = _map_lock_path($ci, $inst, $map);
-  sysopen(my $lfh, $lpath, O_RDWR|O_CREAT, 0660)
-    or die "Lockfile open failed $lpath: $!";
+  my $lfh = _open_lock_file($lpath, 'Lockfile');
 
   my $e = set_file_ownership_and_mode($lpath, $config->{global}{serviceUser}, $config->{global}{serviceGroup}, '0660');
   die "Lockfile-Rechte fehlgeschlagen: $e" if $e;
@@ -1349,8 +1779,7 @@ sub with_config_lock {
   die "Config-Lock-Verzeichnis: $derr" if $derr;
 
   my $lpath = File::Spec->catfile($ldir, 'configs.json.lock');
-  sysopen(my $lfh, $lpath, O_RDWR|O_CREAT, 0660)
-    or die "Config-Lockfile open failed $lpath: $!";
+  my $lfh = _open_lock_file($lpath, 'Config-Lockfile');
   my $perr = set_file_ownership_and_mode($lpath, $config->{global}{serviceUser}, $config->{global}{serviceGroup}, '0660');
   die "Config-Lockfile Rechte: $perr" if $perr;
 
@@ -1398,6 +1827,7 @@ get '/instances/:inst/maps' => sub {
         next if _deny_forbidden_map($e);
         next unless defined map_type_for_file($ci, $e);
         my $p = "$ci->{map_dir}/$e";
+        next if _deny_compiled_map_artifact($e, $p);
         $seen{$e} = 1 if -f $p && !-l $p;
       }
       closedir $dh;
@@ -1407,6 +1837,7 @@ get '/instances/:inst/maps' => sub {
       for my $f (glob "$ci->{map_dir}/$glob") {
         my $bn = basename($f);
         next if _deny_forbidden_map($bn);
+        next if _deny_compiled_map_artifact($bn, $f);
         $seen{$bn} = 1 if -f $f && !-l $f;
       }
     }
@@ -1429,9 +1860,11 @@ get '/instances/:inst/map/*map' => sub {
     unless defined map_type_for_file($ci, $map);
 
   my $path = "$ci->{map_dir}/$map";
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled map artifact not allowed' })
+    if _deny_compiled_map_artifact($map, $path);
   return $c->render(status=>403, json=>{ ok=>0, error=>'symlink not allowed' }) if -l $path;
   unless (-r $path) { return $c->render(status => 404, json => { ok => 0, error => 'Not found' }); }
-  my $text = read_text($path);
+  my $text = read_text_regular($path, 'Map-Datei');
   $c->res->headers->content_type('text/plain; charset=UTF-8');
   $c->render(data => $text);
 };
@@ -1448,6 +1881,10 @@ get '/instances/:inst/backup/*map' => sub {
     if _deny_forbidden_map($base);
   return $c->render(status=>403, json=>{ ok=>0, error=>'map not registered' })
     unless defined map_type_for_file($ci, $base);
+
+  my $map_path = "$ci->{map_dir}/$base";
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled map artifact not allowed' })
+    if _deny_compiled_map_artifact($base, $map_path);
 
   my $backup_dir = effective_backup_dir($ci, $inst)
     or return $c->render(status => 404, json => { ok => 0, error => 'No backup_dir' });
@@ -1477,21 +1914,23 @@ get '/instances/:inst/backupfile/*backup' => sub {
   return $c->render(status=>403, json=>{ ok=>0, error=>'map not registered' })
     unless defined map_type_for_file($ci, $backup_map);
   my $fullpath = "$backup_dir/$backup_file";
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled map artifact not allowed' })
+    if _deny_compiled_map_artifact($backup_map, $fullpath);
   return $c->render(status=>403, json=>{ ok=>0, error=>'symlink not allowed' }) if -l $fullpath;
   unless ($backup_file && -f $fullpath && -r $fullpath) { return $c->render(status => 404, json => { ok => 0, error => 'Backup file not found' }); }
 
   my $mode = $c->param('mode') // 'text';
   if ($mode eq 'download') {
-    my $bytes = read_raw($fullpath);
+    my $bytes = read_raw_regular($fullpath, 'Backup-Datei');
     $c->res->headers->content_disposition(qq{attachment; filename="$backup_file"});
     $c->res->headers->content_type('application/octet-stream');
     return $c->render(data => $bytes);
   } elsif ($mode eq 'json') {
-    my $content = read_text($fullpath);
+    my $content = read_text_regular($fullpath, 'Backup-Datei');
     $content =~ s/\r\n/\n/g;
     return $c->render(json => { ok => 1, name => $backup_file, size => length($content), content => $content });
   } else {
-    my $content = read_text($fullpath);
+    my $content = read_text_regular($fullpath, 'Backup-Datei');
     $c->res->headers->content_type('text/plain; charset=UTF-8');
     return $c->render(data => $content);
   }
@@ -1528,25 +1967,77 @@ post '/instances/:inst/map/*map' => sub {
 
   my $path = "$ci->{map_dir}/$map";
   $logger->info("MAP SAVE REQUEST: instance=$inst map=$map target=$path");
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled map artifact not allowed' })
+    if _deny_compiled_map_artifact($map, $path);
   return $c->render(status=>403, json=>{ ok=>0, error=>'symlink not allowed' }) if -l $path;
+
+  # Request-Body-Groessenlimit (app->max_request_size) pruefen, BEVOR der Body
+  # gelesen wird. Mojolicious kuerzt einen zu grossen Body sonst still und
+  # setzt req->error/is_limit_exceeded, was ohne diese Pruefung unbemerkt
+  # bliebe: der gekuerzte Inhalt wuerde als vollstaendig gespeichert gelten.
+  if ($c->req->can('is_limit_exceeded') && $c->req->is_limit_exceeded) {
+    $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=request_too_large");
+    return $c->render(status=>413, json=>{ ok=>0, error=>'Anfrage zu gross (max_request_size ueberschritten), Body wurde nicht vollstaendig empfangen' });
+  }
 
   # ---- Inhalt einlesen (JSON / x-www-form-urlencoded / raw) ----
   my $new_content;
   my $ct = $c->req->headers->content_type // '';
-  my $json;
   if ($ct =~ m{\bapplication/json\b}i) {
-    $json = eval { $c->req->json };
-    $logger->warn("JSON parse failed: $@") if $@;
-  }
-  if (defined $json) {
-    if (ref($json) eq 'HASH' && exists $json->{content}) { $new_content = $json->{content}; }
-    elsif (!ref($json))                                   { $new_content = "$json"; }
-    else {
-      $new_content = JSON::MaybeXS->new(utf8=>0, canonical=>1)->encode($json);
+    my $raw_json = $c->req->body // '';
+    my $json;
+    my $parse_ok = eval {
+      $json = from_json($raw_json);
+      1;
+    };
+    unless ($parse_ok) {
+      my $json_error = _single_line($@ || 'ungültiges JSON');
+      $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=invalid_json error=$json_error");
+      return $c->render(status=>400, json=>{ ok=>0, error=>'Ungültiger JSON-Body' });
+    }
+
+    if (ref($json) eq 'HASH' && exists $json->{content}) {
+      if (ref($json->{content})) {
+        $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=content_not_scalar");
+        return $c->render(
+          status => 400,
+          json   => { ok => 0, error => 'content muss ein String oder null sein' },
+        );
+      }
+      $new_content = defined($json->{content}) ? "$json->{content}" : '';
+    } elsif (!ref($json)) {
+      # JSON null wird wie ein explizit leerer Inhalt behandelt.
+      $new_content = defined($json) ? "$json" : '';
+    } else {
+      $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=json_container_without_scalar_content");
+      return $c->render(
+        status => 400,
+        json   => { ok => 0, error => 'JSON-Arrays/-Objekte benötigen einen skalaren content-Wert' },
+      );
+    }
+  } else {
+    my $form_content = $c->param('content');
+    if (defined $form_content) {
+      $new_content = $form_content;
+    } else {
+      my $raw_body = $c->req->body // '';
+      my $decode_ok = eval {
+        $new_content = decode('UTF-8', $raw_body, FB_CROAK);
+        1;
+      };
+      unless ($decode_ok) {
+        my $utf8_error = _single_line($@ || 'ungültiges UTF-8');
+        $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=invalid_utf8 error=$utf8_error");
+        return $c->render(status=>400, json=>{ ok=>0, error=>'Raw-Body enthält kein gültiges UTF-8' });
+      }
     }
   }
-  $new_content //= $c->param('content');
-  $new_content //= decode_utf8($c->req->body // '');
+  # Erneute Pruefung: manche Mojolicious-Versionen setzen das Limit-Flag erst
+  # nachdem der Body tatsaechlich (und damit gekuerzt) gelesen wurde.
+  if ($c->req->can('is_limit_exceeded') && $c->req->is_limit_exceeded) {
+    $logger->warn("MAP SAVE REJECTED: instance=$inst map=$map reason=request_too_large_post_read");
+    return $c->render(status=>413, json=>{ ok=>0, error=>'Anfrage zu gross (max_request_size ueberschritten), Body wurde nicht vollstaendig empfangen' });
+  }
   $new_content =~ s/\r\n/\n/g if defined $new_content;
 
   # ---- map_dir sicherstellen ----
@@ -1578,70 +2069,64 @@ post '/instances/:inst/map/*map' => sub {
     return $c->render(json => \%result, status => 403);
   }
 
-  # ---- alten Inhalt lesen ----
-  my $old_content = '';
-  my $read_error = 0;
-  try {
-    $old_content = (-e $path) ? read_text($path) : '';
-  } catch {
-    $read_error = $_; $logger->error("Fehler beim Lesen von $path: $_");
-  };
-  if ($read_error) {
-    $result{ok} = 0; $result{error} = "Fehler beim Lesen: $read_error";
+  # Vergleich, Backup und Schreiben erfolgen unter demselben Map-Lock. Damit
+  # kann kein zweiter API-Writer zwischen Vergleich und atomarem Rename einen
+  # inzwischen veralteten Stand unterschieben.
+  my $lock_err;
+  eval {
+    with_map_lock($ci, $map, 1, sub {
+      die "Binäres Map-Artefakt darf nicht überschrieben werden: $path"
+        if _deny_compiled_map_artifact($map, $path);
+
+      my $exists = -e $path ? 1 : 0;
+      my $old_content = $exists ? read_text_regular($path, 'Map-Datei') : '';
+
+      # Minimalinhalt, wenn eine neue Map mit leerem Body angelegt wird.
+      if (!$exists && (!defined($new_content) || $new_content eq '')) {
+        $new_content = "#\n";
+      }
+
+      return 1 if $new_content eq $old_content;
+
+      $result{changed} = 1;
+      my $bdir = effective_backup_dir($ci, $inst);
+      if ($exists) {
+        backup_file($path, $bdir, $ci->{max_backups} // 5, $ci);
+        $result{backup} = 'ok';
+      } else {
+        $result{backup} = 'not_existing';
+      }
+
+      atomic_write(
+        $path, $new_content,
+        effective_service_user(),
+        effective_service_group(),
+        effective_file_mode()
+      );
+      $logger->info("Atomic write: $path (user=".effective_service_user().", group=".effective_service_group().", mode=".effective_file_mode().")");
+      $result{write} = 'ok';
+
+      execute_postmap($ci, $map, $inst, \%result);
+      execute_reload_and_status($ci, $inst, \%result);
+      return 1;
+    }, $inst);
+    1;
+  } or do { $lock_err = $@; };
+
+  if ($lock_err) {
+    $logger->error("MAP SAVE FAILED: instance=$inst map=$map error=" . _single_line($lock_err));
+    if ($lock_err =~ /Lock-Timeout/) {
+      return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
+    }
+    $result{ok} = 0; $result{error} = "$lock_err";
     return $c->render(json => \%result, status => 500);
   }
 
-  # ---- Minimalinhalt, wenn NEU & leerer Body ----
-  if (!-e $path) {
-    $new_content = "#\n" unless defined($new_content) && $new_content ne '';
-  }
-
-  if ($new_content ne $old_content) {
-    $result{changed} = 1;
-
-    my $lock_err;
-    eval {
-      with_map_lock($ci, $map, 1, sub {
-        my $bdir = effective_backup_dir($ci, $inst);
-
-        if (-e $path) {
-          backup_file($path, $bdir, $ci->{max_backups} // 5, $ci);
-          $result{backup} = 'ok';
-        } else {
-          $result{backup} = 'not_existing';
-        }
-
-        atomic_write(
-          $path, $new_content,
-          effective_service_user(),
-          effective_service_group(),
-          effective_file_mode()
-        );
-        $logger->info("Atomic write: $path (user=".effective_service_user().", group=".effective_service_group().", mode=".effective_file_mode().")");
-        $result{write} = 'ok';
-
-        execute_postmap($ci, $map, $inst, \%result);
-        execute_reload_and_status($ci, $inst, \%result);
-      }, $inst);
-      1;
-    } or do { $lock_err = $@; };
-
-    if ($lock_err) {
-      $logger->error("MAP SAVE FAILED: instance=$inst map=$map error=" . _single_line($lock_err));
-      if ($lock_err =~ /Lock-Timeout/) {
-        return $c->render(status => 423, json => { ok => 0, error => 'Map locked (timeout)' });
-      }
-      $result{ok} = 0; $result{error} = "$lock_err";
-      return $c->render(json => \%result, status => 500);
-    }
-
+  if ($result{changed}) {
     $logger->info("MAP SAVE OK: instance=$inst map=$map changed=1");
-    return $c->render(json => \%result);
+  } else {
+    $logger->info("MAP SAVE SKIPPED: instance=$inst map=$map reason=no_change");
   }
-
-  $result{write}  = 'skipped';
-  $result{backup} = 'skipped';
-  $logger->info("MAP SAVE SKIPPED: instance=$inst map=$map reason=no_change");
   return $c->render(json => \%result);
 };
 
@@ -1669,20 +2154,28 @@ post '/instances/:inst/restore/*backupfile' => sub {
     if _deny_forbidden_map($map);
   return $c->render(status=>403, json=>{ ok=>0, error=>'map not registered' })
     unless defined map_type_for_file($ci, $map);
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled map artifact not allowed' })
+    if _deny_compiled_map_artifact($map, $src);
   return $c->render(status=>403, json=>{ ok=>0, error=>'symlink not allowed' }) if -l $src;
 
   my $dst = "$map_dir/$map";
   $logger->info("RESTORE START: instance=$inst map=$map backup=$backupfile target=$dst");
 
   my %result = ( ok => 1, restored => $backupfile, target => $dst );
+  return $c->render(status=>403, json=>{ ok=>0, error=>'compiled restore target not allowed' })
+    if _deny_compiled_map_artifact($map, $dst);
   return $c->render(status=>403, json=>{ ok=>0, error=>'restore target symlink not allowed' }) if -l $dst;
 
   my $lock_err;
   eval {
     with_map_lock($ci, $map, 1, sub {
-      my $restore_content = read_text($src);
+      die "Binäres Backup-Artefakt darf nicht wiederhergestellt werden: $src"
+        if _deny_compiled_map_artifact($map, $src);
+      die "Binäres Map-Artefakt darf nicht überschrieben werden: $dst"
+        if _deny_compiled_map_artifact($map, $dst);
+
+      my $restore_content = read_text_regular($src, 'Backup-Datei');
       if (-f $dst) {
-        _assert_not_symlink($dst, 'Restore-Ziel');
         my $before = backup_file($dst, $backup_dir, $ci->{max_backups} // 5, $ci);
         $result{pre_restore_backup} = $before;
       }
@@ -1736,7 +2229,7 @@ post '/instances/:inst/delmap/*map' => sub {
   eval {
     with_config_lock(sub {
       $instances_data = -e $instances_cfg_file
-        ? JSON::MaybeXS->new(utf8=>0)->decode( read_text($instances_cfg_file) )
+        ? from_json(read_text($instances_cfg_file))
         : {};
 
       $has_wrapper = ref($instances_data->{instances}) eq 'HASH' ? 1 : 0;
@@ -1833,7 +2326,7 @@ post '/instances/:inst/globs' => sub {
     @items = ref($j->{items}) eq 'ARRAY' ? @{$j->{items}} : ($j);
   } else {
     if (defined(my $items_param = $c->param('items'))) {
-      my $arr = eval { JSON::MaybeXS->new->decode($items_param) } || [];
+      my $arr = eval { from_json($items_param) } || [];
       @items = @$arr if ref($arr) eq 'ARRAY';
     }
     if (!@items) {
@@ -1843,15 +2336,21 @@ post '/instances/:inst/globs' => sub {
     }
   }
 
-  unless (@items && ref($items[0]) eq 'HASH') {
+  unless (@items) {
     return $c->render(status=>400, json=>{ ok=>0, error=>'Payload fehlt oder ungültig' });
   }
 
   my @changes;
-  my %seen;
+  my %seen_type;
   for my $it (@items) {
+    return $c->render(status=>400, json=>{ok=>0,error=>'Jedes items-Element muss ein Objekt sein'})
+      unless ref($it) eq 'HASH';
+
     my $map_raw  = $it->{map}  // '';
     my $type_raw = $it->{type} // '';
+
+    return $c->render(status=>400, json=>{ok=>0,error=>'map und type müssen Strings sein'})
+      if ref($map_raw) || ref($type_raw);
 
     return $c->render(status=>400, json=>{ok=>0,error=>'map fehlt'})  unless length $map_raw;
     return $c->render(status=>400, json=>{ok=>0,error=>'type fehlt'}) unless length $type_raw;
@@ -1867,8 +2366,14 @@ post '/instances/:inst/globs' => sub {
     return $c->render(status=>400, json=>{ok=>0,error=>"ungültiger type: $type_norm"})
       unless $GLOB_TYPES{$type_norm};
 
-    my $key = "$map\x1F$type_norm";
-    next if $seen{$key}++;
+    if (exists $seen_type{$map}) {
+      return $c->render(status=>400, json=>{
+        ok=>0,
+        error=>"Map-Key '$map' ist im selben Request mit unterschiedlichen Typen definiert",
+      }) if $seen_type{$map} ne $type_norm;
+      next;
+    }
+    $seen_type{$map} = $type_norm;
     push @changes, [$map, $type_norm];
   }
 
@@ -1900,8 +2405,8 @@ post '/instances/:inst/globs' => sub {
   return $c->render(json => { ok=>1, instance=>$inst, upserted=>\@applied });
 };
 
-# ======== API: globs delete (einzelner Key) ==================================
-del '/instances/:inst/globs/:map' => sub {
+# ======== API: globs delete (einzelner exakter Key; Punkte erlaubt) ==========
+del '/instances/:inst/globs/#map' => sub {
   my $c    = shift;
   my $inst = $c->stash('inst');
   return $c->render(status=>404, json=>{ok=>0,error=>'Unknown instance'})
@@ -1913,22 +2418,51 @@ del '/instances/:inst/globs/:map' => sub {
   my ($had, $cfg_err);
   eval {
     with_config_lock(sub {
-      my $cfg = _read_cfg_hash();
+      my $cfg  = _read_cfg_hash();
       my $node = _inst_node_rw($cfg, $inst);
-      $had = (ref($node->{globs}) eq 'HASH') && exists $node->{globs}{$map};
-      delete $node->{globs}{$map} if $had;
+      my $globs = (ref($node->{globs}) eq 'HASH') ? $node->{globs} : {};
+
+      # Exakter Registrierungsnachweis ist die einzige Löschfreigabe.
+      # Wildcard-Muster werden hier bewusst nicht ausgewertet.
+      $had = exists $globs->{$map} ? 1 : 0;
+      return 1 unless $had;
+
+      delete $globs->{$map};
       validate_config($global, (ref($cfg->{instances}) eq 'HASH' ? $cfg->{instances} : $cfg));
       _write_cfg_hash_atomic($cfg);
       _rebuild_cfgmap_from($cfg);
+      return 1;
     });
     1;
   } or $cfg_err = $@;
+
   if ($cfg_err) {
     $logger->error("CONFIG DELETE FAILED: instance=$inst map=$map error=" . _single_line($cfg_err));
     return $c->render(status=>500, json=>{ok=>0,error=>"configs.json aktualisieren: $cfg_err"});
   }
-  $logger->info("CONFIG DELETE OK: instance=$inst map=$map removed=" . ($had ? 1 : 0));
-  $c->render(json => { ok=>1, instance=>$inst, map=>$map, removed=>($had?JSON::MaybeXS::true:JSON::MaybeXS::false) });
+
+  unless ($had) {
+    $logger->info("CONFIG DELETE SKIPPED: instance=$inst map=$map reason=not_registered");
+    return $c->render(
+      status => 404,
+      json   => {
+        ok      => 0,
+        instance=> $inst,
+        map     => $map,
+        removed => false,
+        error   => 'Map key not registered',
+      },
+    );
+  }
+
+  $logger->info("CONFIG DELETE OK: instance=$inst map=$map removed=1");
+  return $c->render(json => {
+    ok      => 1,
+    instance=> $inst,
+    map     => $map,
+    removed => true,
+    note    => 'Only configs.json was changed; no Postfix file was deleted',
+  });
 };
 
 # Health
@@ -1958,10 +2492,13 @@ if ($ssl_enable && $ssl_cert && $ssl_key) {
   $url = sprintf('http://%s', $listen_addr);
 }
 
-try {
+my $start_log_ok = eval {
   $logger->info("SERVICE START OK: version=$VERSION listen=$url require_https=".($require_https?1:0)." instances=".scalar(keys %$instances));
-} catch {
-  $logger->error("Logger-Fehler: " . _single_line($_));
+  1;
 };
+unless ($start_log_ok) {
+  $logger->error("Logger-Fehler: " . _single_line($@ || 'unbekannter Fehler'));
+}
 
 app->start('daemon', '-l', $url);
+
